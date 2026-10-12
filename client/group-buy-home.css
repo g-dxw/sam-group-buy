@@ -1,0 +1,415 @@
+.group-buy-home-shell {
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: 32px 24px 40px;
+}
+
+.group-buy-home .header-inner {
+  max-width: 1040px;
+}
+
+.group-buy-header-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.group-buy-home-intro {
+  position: relative;
+  margin-bottom: 28px;
+  padding: 32px 36px;
+  border: 1px solid #e1e9db;
+  border-radius: 18px;
+  background: #eff3e9;
+}
+
+.group-buy-home-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--green-dark);
+  font-size: 13px;
+}
+
+.group-buy-home-intro h1 {
+  margin: 12px 0 10px;
+  font-size: 30px;
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.group-buy-home-intro > p {
+  padding-right: 140px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.8;
+}
+
+.group-buy-home-count {
+  position: absolute;
+  right: 36px;
+  bottom: 34px;
+  color: var(--green);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.group-buy-home-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 22px;
+}
+
+.group-buy-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: #fff;
+}
+
+.group-buy-card-body {
+  padding: 21px 22px 17px;
+}
+
+.group-buy-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.group-buy-community {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 7px;
+  min-width: 0;
+  color: var(--green-dark);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.group-buy-community svg {
+  margin-top: 2px;
+}
+
+.group-buy-active {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: #edf5ee;
+  color: var(--green);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.group-buy-active i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.group-buy-period {
+  margin-top: 15px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.group-buy-card h2 {
+  display: -webkit-box;
+  margin-top: 5px;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.group-buy-description {
+  display: -webkit-box;
+  margin-top: 9px;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+
+.group-buy-cover {
+  display: grid;
+  grid-template-columns: repeat(var(--cover-count), minmax(0, 1fr));
+  gap: 10px;
+  height: 128px;
+  margin: 0 22px;
+}
+
+.group-buy-cover > div {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid #edf0e8;
+  border-radius: 10px;
+  background: #fafbf8;
+}
+
+.group-buy-cover img {
+  width: 100%;
+  height: 100%;
+  padding: 8px;
+  object-fit: contain;
+}
+
+.group-buy-cover-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 10px;
+  color: #6b886b;
+  font-size: 12px;
+}
+
+.group-buy-card-bottom {
+  margin-top: auto;
+  padding: 20px 22px;
+}
+
+.group-buy-schedule {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin: 0;
+}
+
+.group-buy-schedule > div {
+  min-width: 0;
+}
+
+.group-buy-schedule dt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.group-buy-schedule dd {
+  margin: 6px 0 0;
+  font-size: 13px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+
+.group-buy-schedule .group-buy-pickup {
+  grid-column: 1 / -1;
+}
+
+.group-buy-card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.group-buy-card-actions > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.group-buy-enter {
+  flex-shrink: 0;
+  text-decoration: none;
+  transition: background .18s ease;
+}
+
+.group-buy-home-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-height: 240px;
+  padding: 40px 20px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.8;
+}
+
+.group-buy-home-empty {
+  padding: 48px 24px;
+  border: 1px dashed #d9e2d3;
+  border-radius: 16px;
+  background: #fff;
+  text-align: center;
+}
+
+.group-buy-state-icon {
+  display: grid;
+  place-items: center;
+  width: 66px;
+  height: 66px;
+  margin: 0 auto 18px;
+  border-radius: 50%;
+  background: var(--cream);
+  color: var(--green);
+}
+
+.group-buy-home-empty h2 {
+  font-size: 20px;
+  line-height: 1.6;
+}
+
+.group-buy-home-empty p {
+  max-width: 430px;
+  margin: 10px auto 22px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+
+.group-buy-home-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 30px;
+  padding-top: 22px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.8;
+  text-align: center;
+}
+
+.batch-all-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 44px;
+  margin: -8px 0 14px;
+  padding: 8px 4px;
+  color: var(--green);
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.batch-all-link svg {
+  transform: rotate(180deg);
+}
+
+.batch-all-link:hover {
+  text-decoration: underline;
+}
+
+.group-buy-home a:focus-visible,
+.batch-all-link:focus-visible {
+  outline: 3px solid #8fbba2;
+  outline-offset: 4px;
+}
+
+@media (max-width: 700px) {
+  .group-buy-home-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 18px;
+  }
+
+  .group-buy-home-intro > p {
+    padding-right: 0;
+  }
+
+  .group-buy-home-count {
+    position: static;
+    display: inline-block;
+    margin-top: 17px;
+  }
+}
+
+@media (max-width: 480px) {
+  .group-buy-home-shell {
+    padding: 20px 16px 30px;
+  }
+
+  .group-buy-header-note {
+    display: none;
+  }
+
+  .group-buy-home-intro {
+    margin-bottom: 20px;
+    padding: 24px 21px;
+    border-radius: 15px;
+  }
+
+  .group-buy-home-intro h1 {
+    font-size: 26px;
+  }
+
+  .group-buy-card-body {
+    padding: 18px 18px 15px;
+  }
+
+  .group-buy-card h2 {
+    font-size: 19px;
+  }
+
+  .group-buy-cover {
+    height: 108px;
+    margin: 0 18px;
+    gap: 8px;
+  }
+
+  .group-buy-cover img {
+    padding: 6px;
+  }
+
+  .group-buy-card-bottom {
+    padding: 18px;
+  }
+
+  .group-buy-schedule {
+    gap: 14px;
+  }
+
+  .group-buy-enter {
+    padding-left: 17px;
+    padding-right: 17px;
+  }
+
+  .group-buy-home-empty {
+    padding: 38px 20px;
+  }
+
+  .batch-all-link {
+    margin-top: -5px;
+    margin-bottom: 10px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .group-buy-enter {
+    transition: none;
+  }
+
+  .group-buy-home .spinner {
+    animation: none;
+  }
+}

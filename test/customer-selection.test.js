@@ -335,6 +335,23 @@ test('a stable private ID uses the recommendation fee when the same store and SP
   assert.equal(f.service.queryOrders(f.batch, original.input.phone).totalCents, 7169);
 });
 
+test('a private alias that reuses a newly marked-up local SKU keeps a consistent fixed draft and preserves the source original', async t => {
+  const f = fixture(t); const personal = await add(f);
+  const selected = await f.sams.search({ keyword: '商品', storeId: '6505', storeType: '2', cityCode: '440300', page: '1' });
+  f.service.selectProducts(f.sams.resolveSelections({ selections: [{ selectionId: selected.selectionId, spuIds: ['111'] }] }));
+  f.service.updateProduct('sam_111', { pricing: { mode: 'markup', markupBps: 1000 }, onSale: true });
+  f.service.updateBatch(f.batch.code, { productIds: ['ordinary', 'sam_111'] });
+  const refreshed = f.customer.list(f.batch, token).products.find(product => product.id === personal.id);
+  assert.equal(refreshed.priceCents, 3278);
+  await f.customer.submit(f.batch, token, order(f, [refreshed]));
+  const saved = f.store.getProduct(personal.id);
+  assert.equal(saved.priceCents, 3278); assert.equal(saved.originalPriceCents, 2980);
+  assert.deepEqual(saved.pricing, { mode: 'fixed', markupBps: null });
+  f.service.updateProduct(saved.id, { name: '整理个人草稿' });
+  assert.equal(f.store.getProduct(saved.id).priceCents, 3278);
+  assert.equal(f.service.queryOrders(f.batch, '13800138000').totalCents, 3278);
+});
+
 test('old SQLite batches and ordinary orders migrate without needing a store or changing existing amounts', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'sam-customer-migration-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

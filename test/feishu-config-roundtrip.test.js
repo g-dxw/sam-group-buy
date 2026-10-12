@@ -79,7 +79,7 @@ function isolatedRemote() {
 function fixture(t) {
   const store = new LocalStore({ path: ':memory:' });
   t.after(() => store.close());
-  store.setMeta('exportSource', { ...targets.A, imageUrlTemplate: '/images/{id}/cover.svg' });
+  store.setMeta('exportSource', { ...targets.A, orderScope: 'shared', imageUrlTemplate: '/images/{id}/cover.svg' });
   store.importProducts([{ id: 'P1', name: '演示牛奶', spec: '12盒', unit: '箱', priceCents: 1000,
     category: '演示', onSale: true, sort: 1 }]);
   const community = store.createCommunity({ name: '往返同步验收群' });
@@ -91,7 +91,7 @@ function fixture(t) {
   const remote = isolatedRemote();
   const config = new FeishuConfigService({ store, larkCall: remote.larkCall });
   const sync = new FeishuSync({ store, larkCall: remote.larkCall, readRecordsCall: remote.readRecordsCall,
-    createBatchViews: false, backoffMs: [] });
+    communityTables: false, createBatchViews: false, backoffMs: [] });
   const saveTarget = target => config.save({ ...targets[target], revision: config.get().revision });
   return { store, batch, lineId, remote, config, sync, saveTarget };
 }
@@ -106,7 +106,7 @@ test('配置A→B→A后复用各自原明细，现有同步实例将当前数�
   assert.equal(store.listExportLines(batch.code)[0].remoteRecordId, originalAId);
 
   assert.equal((await saveTarget('B')).changedDestination, true);
-  assert.equal(store.listExportLines(batch.code)[0].remoteRecordId, null);
+  assert.equal(store.listExportLines(batch.code)[0].remoteRecordId, originalAId, 'config changes preserve the old binding until this period is synced');
   store.updateOrder(batch.code, lineId, { quantity: 5 });
   assert.equal((await sync.syncOrders(batch.code)).status, 'success');
   const originalBId = b.rows[0].record_id;

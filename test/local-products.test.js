@@ -145,7 +145,7 @@ test('rank browsing provenance survives closing and reopening its temporary data
   } finally { store.close(); }
 });
 
-test('editable price and product information preserve legacy dynamic amounts atomically and reject stale new orders', (t) => {
+test('editable retail price freezes legacy amounts, rejects stale submissions and preserves export revision safety', (t) => {
   const { store, service } = fixture(t);
   const batch = offered(service);
   const oldOrder = order(service, batch);
@@ -163,15 +163,29 @@ test('editable price and product information preserve legacy dynamic amounts ato
   assert.equal(result.product.source.priceCents, 9900);
   assert.notEqual(result.product.version, oldVersion);
   const dirty = store.listExportLines(batch.code, { onlyDirty: true });
-  assert.equal(dirty.length, 1);
-  assert.equal(dirty[0].revision, 2);
-  assert.equal(dirty[0].syncedRevision, 1);
-  assert.equal(dirty[0].remoteRecordId, 'remote-1');
-  assert.equal(dirty[0].amountCents, 24600);
-  assert.equal(service.queryOrders(batch, phone).totalCents, 24600);
+  assert.equal(dirty.length, 0);
+  const frozen = store.listExportLines(batch.code)[0];
+  assert.equal(frozen.revision, 1);
+  assert.equal(frozen.syncedRevision, 1);
+  assert.equal(frozen.remoteRecordId, 'remote-1');
+  assert.equal(frozen.snapshot.name, selected().name);
+  assert.equal(frozen.snapshot.spec, selected().spec);
+  assert.equal(frozen.snapshot.unit, selected().unit);
+  assert.equal(frozen.priceCents, 9900);
+  assert.equal(frozen.amountCents, 19800);
+  assert.equal(service.queryOrders(batch, phone).totalCents, 19800);
   assert.throws(() => service.submit(batch, { ...oldOrder, submissionId: randomUUID() }), { code: 'PRODUCT_CHANGED' });
+  assert.equal(service.submit(batch, oldOrder).status, 'completed');
+  assert.equal(store.markExported(batch.code, original.lineId, original.revision, 'remote-1'), true);
+  service.submit(batch, { ...order(service, batch), phone: '13900139000' });
+  assert.equal(service.queryOrders(batch, '13900139000').totalCents, 24600);
+  service.updateOrder(batch.code, original.recordId, { quantity: 3 });
   assert.equal(store.markExported(batch.code, original.lineId, original.revision, 'remote-1'), false);
-  assert.equal(store.listExportLines(batch.code, { onlyDirty: true }).length, 1);
+  const editedLegacy = store.listExportLines(batch.code, { onlyDirty: true }).find(line => line.lineId === original.lineId);
+  assert.equal(editedLegacy.revision, 2);
+  assert.equal(editedLegacy.syncedRevision, 1);
+  assert.equal(editedLegacy.priceCents, 9900);
+  assert.equal(editedLegacy.amountCents, 29700);
 });
 
 test('unchanged patch is a no-op; metadata and sale edits update product revision without dirtying order amounts', (t) => {

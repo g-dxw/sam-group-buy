@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { lark } from './lark.js';
 import { DomainError } from './order-service.js';
-import { EXPORT_FIELDS, ORDER_FEE_SCHEMA, PRODUCT_SCHEMA, PRODUCT_BACKUP_SCHEMA, productDestination, productBackupArchiveKey } from './feishu-sync.js';
+import { EXPORT_FIELDS, ORDER_FEE_SCHEMA, ORDER_SPLIT_SCHEMA, PRODUCT_SCHEMA, PRODUCT_BACKUP_SCHEMA, productDestination, productBackupArchiveKey } from './feishu-sync.js';
 
 const REVISION_KEY = 'feishu-config-revision';
 const CHECK_KEY = 'feishu-config-last-check';
@@ -9,8 +9,9 @@ const CONFIG_KEYS = ['feishuUrl', 'baseToken', 'productTableId', 'orderTableId']
 const TOKEN = /^[A-Za-z0-9]{10,128}$/;
 const TABLE_ID = /^tbl[A-Za-z0-9]{3,125}$/;
 const PRODUCT_EXTRA_SCHEMA = Object.fromEntries(Object.entries(PRODUCT_BACKUP_SCHEMA).filter(([name]) => !Object.hasOwn(PRODUCT_SCHEMA, name)));
-const BACKUP_MESSAGE = '本地商品库为主数据；手动备份会新增或更新商品记录，并补齐图片、来源和版本字段。连接检查未验证写入权限。';
+const BACKUP_MESSAGE = '本地商品库为主数据；手动备份会新增或更新全部保留商品记录，并补齐图片、来源、版本、定价规则和移除时间字段；单价保存最终售价，定价规则保存参考原价与加价设置（固定加价金额或比例，兼容旧固定售价）。已移除商品保留下架备份，恢复后清空移除时间。连接检查未验证写入权限。';
 const FEE_COMPATIBILITY_MESSAGE = '此订单表仅支持零费订单备份；有代购费或非零费率时，请先手动补齐收费字段。本地订单会正常保存。';
+const SPLIT_COMPATIBILITY_MESSAGE = '备份拼份订单前，请手动添加唯一的 text 字段「同步拼份信息」，保存拆分规则和成团分配。本地订单会正常保存。';
 const NUMBER_FIELDS = new Set(['数量', '预期明细数', '同步单价', '同步金额', '数据版本']);
 const OPTIONS = { 处理状态: ['待采购', '已买到', '缺货', '已领取', '已取消'], 同步状态: ['待确认', '已确认'] };
 const ORDER_SCHEMA = Object.fromEntries(EXPORT_FIELDS.map(name => [name,
@@ -102,13 +103,25 @@ function orderSchemaCheck(fields) {
   const presentFeeSchema = Object.fromEntries(Object.entries(ORDER_FEE_SCHEMA).filter(([name]) => fields.some(field => field.name === name)));
   const feeErrors = missingFields(fields, presentFeeSchema);
   const missingFeeFields = missingFields(fields, ORDER_FEE_SCHEMA);
-  return { missingFields: [...missingFields(fields, ORDER_SCHEMA), ...feeErrors], missingFeeFields,
-    feeCompatible: !missingFeeFields.length };
+  const presentSplitSchema = Object.fromEntries(Object.entries(ORDER_SPLIT_SCHEMA).filter(([name]) => fields.some(field => field.name === name)));
+  const splitErrors = missingFields(fields, presentSplitSchema);
+  const missingSplitFields = missingFields(fields, ORDER_SPLIT_SCHEMA);
+  return { missingFields: [...missingFields(fields, ORDER_SCHEMA), ...feeErrors, ...splitErrors], missingFeeFields,
+    feeCompatible: !missingFeeFields.length, missingSplitFields, splitCompatible: !missingSplitFields.length };
 }
 function storedFeeCheck(value) {
   const missingFeeFields = (Array.isArray(value?.missingFeeFields) ? value.missingFeeFields : Object.keys(ORDER_FEE_SCHEMA))
     .filter(name => Object.hasOwn(ORDER_FEE_SCHEMA, name));
   return { feeCompatible: value?.feeCompatible === true && !missingFeeFields.length, missingFeeFields };
+}
+function storedSplitCheck(value) {
+  const missingSplitFields = (Array.isArray(value?.missingSplitFields) ? value.missingSplitFields : Object.keys(ORDER_SPLIT_SCHEMA))
+    .filter(name => Object.hasOwn(ORDER_SPLIT_SCHEMA, name));
+  return { splitCompatible: value?.splitCompatible === true && !missingSplitFields.length, missingSplitFields };
+}
+function orderCompatibilityMessage(value) {
+  return ['必需字段及类型检查通过。', value.feeCompatible ? '' : FEE_COMPATIBILITY_MESSAGE,
+    value.splitCompatible ? '' : SPLIT_COMPATIBILITY_MESSAGE].join('');
 }
 function fingerprint(source) {
   return createHash('sha256').update(JSON.stringify([source?.baseToken || '', source?.orderTableId || ''])).digest('hex').slice(0, 24);
@@ -123,9 +136,8 @@ function storedCheck(value, config) {
     checks: { base: { status: 'success', message: '多维表格可读取。' },
       products: { status: 'success', message: '商品备份目标的必需字段及类型检查通过。', missingFields: [],
         fieldsToCreate: (value.checks.products.fieldsToCreate || []).filter(name => Object.hasOwn(PRODUCT_EXTRA_SCHEMA, name)) },
-      orders: { status: 'success', message: storedFeeCheck(value.checks.orders).feeCompatible
-        ? '必需字段及收费字段检查通过。' : `必需字段及类型检查通过。${FEE_COMPATIBILITY_MESSAGE}`,
-        missingFields: [], ...storedFeeCheck(value.checks.orders) } },
+      orders: { status: 'success', message: orderCompatibilityMessage({ ...storedFeeCheck(value.checks.orders), ...storedSplitCheck(value.checks.orders) }),
+        missingFields: [], ...storedFeeCheck(value.checks.orders), ...storedSplitCheck(value.checks.orders) } },
     writeMode: 'manual_one_way_backup', message: BACKUP_MESSAGE };
 }
 function publicCheckError(error) {
@@ -137,9 +149,12 @@ export class FeishuConfigService {
   constructor({ store, larkCall = lark }) { Object.assign(this, { store, larkCall }); }
 
   get() {
-    const config = projectConfig(this.store.getMeta('exportSource') || {});
+    const source = this.store.getMeta('exportSource') || {};
+    const config = projectConfig(source);
     const lastCheck = storedCheck(this.store.getMeta(CHECK_KEY), config);
     return { config, revision: this.revision(), writeMode: 'manual_one_way_backup',
+      orderScope: source.orderScope === 'shared' ? 'shared' : 'community',
+      groupTablesCreatedAutomatically: source.orderScope !== 'shared',
       ...(lastCheck ? { lastCheck } : {}) };
   }
   revision() { return revisionValue(this.store.getMeta(REVISION_KEY) ?? 0); }
@@ -209,7 +224,8 @@ export class FeishuConfigService {
           const missingOrderFields = orderCheck.missingFields;
           return { ...table, productCompatible: !missingProductFields.length, orderCompatible: !missingOrderFields.length,
             missingProductFields, missingOrderFields, productBackupFieldsToCreate: productCheck.fieldsToCreate,
-            feeCompatible: orderCheck.feeCompatible, missingFeeFields: orderCheck.missingFeeFields };
+            feeCompatible: orderCheck.feeCompatible, missingFeeFields: orderCheck.missingFeeFields,
+            splitCompatible: orderCheck.splitCompatible, missingSplitFields: orderCheck.missingSplitFields };
         })));
       }
       return { base, tables: checked };
@@ -243,10 +259,10 @@ export class FeishuConfigService {
           const missing = productCheck?.missingFields || orderCheck?.missingFields || missingFields(fields, definitions);
           checks[key] = { status: missing.length ? 'error' : 'success',
             message: missing.length ? '表结构不兼容，请补齐字段或选择另一张表。' : key === 'products'
-              ? '商品备份目标检查通过；首次备份会补齐缺少的备份字段。' : orderCheck.feeCompatible
-                ? '必需字段及收费字段检查通过。' : `必需字段及类型检查通过。${FEE_COMPATIBILITY_MESSAGE}`,
+              ? '商品备份目标检查通过；首次备份会补齐缺少的备份字段。' : orderCompatibilityMessage(orderCheck),
             missingFields: missing, ...(productCheck ? { fieldsToCreate: productCheck.fieldsToCreate } : {}),
-            ...(orderCheck ? { feeCompatible: orderCheck.feeCompatible, missingFeeFields: orderCheck.missingFeeFields } : {}) };
+            ...(orderCheck ? { feeCompatible: orderCheck.feeCompatible, missingFeeFields: orderCheck.missingFeeFields,
+              splitCompatible: orderCheck.splitCompatible, missingSplitFields: orderCheck.missingSplitFields } : {}) };
         } catch { checks[key] = { status: 'error', message: '暂时无法确认此表的结构，请稍后重试。' }; }
       }
       if ([checks.products, checks.orders].some(result => result.status !== 'success')) {
@@ -271,6 +287,19 @@ export class FeishuConfigService {
       throw new DomainError(409, 'FEISHU_CONFIG_PENDING_EXPORT', '存在尚未确认的飞书新增记录，请先完成订单同步核查，再切换订单表。');
     }
   }
+  pinLegacyDestinations(source) {
+    if (!source.baseToken || !source.orderTableId) return;
+    const entries = new Map(this.exportMetadata().map(({ key, value }) => [key, value]));
+    for (const row of this.store.db.prepare('SELECT DISTINCT batch_code FROM order_lines WHERE remote_record_id IS NOT NULL').all()) {
+      const key = `feishu-export:${row.batch_code}`;
+      if (!entries.has(key)) entries.set(key, {});
+    }
+    for (const [key, meta] of entries) {
+      if (meta.destination) continue;
+      this.store.setMeta(key, { ...meta, destination: { baseToken: source.baseToken, orderTableId: source.orderTableId },
+        scope: 'legacy', tableName: '历史订单表', feishuUrl: source.feishuUrl || null });
+    }
+  }
   async save(input) {
     normalizeConfig(input);
     const expectedRevision = revisionValue(input.revision);
@@ -280,24 +309,22 @@ export class FeishuConfigService {
     return this.store.transaction(() => {
       if (expectedRevision !== this.revision()) throw new DomainError(409, 'FEISHU_CONFIG_REVISION_CONFLICT', '飞书配置已更新，请刷新后再保存。');
       const oldSource = this.store.getMeta('exportSource') || {};
-      const changedDestination = oldSource.baseToken !== checked.config.baseToken || oldSource.orderTableId !== checked.config.orderTableId;
+      const historicalOrderTableChanged = oldSource.orderTableId !== checked.config.orderTableId;
+      const changedDestination = oldSource.baseToken !== checked.config.baseToken
+        || oldSource.orderScope === 'shared' && historicalOrderTableChanged;
       const changedProductDestination = productDestination(oldSource) !== productDestination(checked.config);
       let markedPending = 0;
       if (changedDestination) {
         const entries = this.exportMetadata();
         this.assertNoPendingCreates(entries);
         this.assertNoPendingCreates(this.exportMetadata(`feishu-export-archive:${fingerprint(checked.config)}:`));
-        const oldFingerprint = fingerprint(oldSource);
-        for (const { key, value } of entries) {
-          const code = key.slice('feishu-export:'.length);
-          this.store.setMeta(`feishu-export-archive:${oldFingerprint}:${code}`, value);
-          this.store.db.prepare('DELETE FROM meta WHERE key=?').run(key);
-        }
         markedPending = this.store.db.prepare('SELECT count(*) AS total FROM order_lines').get().total;
-        this.store.db.exec('UPDATE order_lines SET remote_record_id=NULL,synced_revision=0,export_error=NULL');
       }
+      // Keep the exact old destination until that period is explicitly synced.
+      // Changing the reference table must never reassign another group's records.
+      this.pinLegacyDestinations(oldSource);
       const revision = expectedRevision + 1;
-      const source = { ...oldSource, ...checked.config };
+      const source = { ...oldSource, ...checked.config, orderScope: oldSource.orderScope === 'shared' ? 'shared' : 'community' };
       let productsMarkedPending = 0;
       if (changedProductDestination) {
         const previous = this.store.getMeta('feishu-product-backup');
@@ -306,7 +333,7 @@ export class FeishuConfigService {
         const archived = this.store.getMeta(productBackupArchiveKey(destination));
         // Preserve unresolved creates when returning to a target; they must be reconciled before any retry.
         const records = Object.fromEntries(Object.entries(archived?.records || {}).map(([id, record]) => [id, { ...record, revision: 0 }]));
-        productsMarkedPending = this.store.listProducts().length;
+        productsMarkedPending = this.store.listProducts({ includeRemoved: true }).length;
         this.store.setMeta('feishu-product-backup', { destination, records, status: 'pending',
           counts: { created: 0, updated: 0, unchanged: 0, total: productsMarkedPending, backedUp: 0, pending: productsMarkedPending },
           pending: productsMarkedPending, lastSyncedAt: archived?.lastSyncedAt || null, error: null });
@@ -314,7 +341,8 @@ export class FeishuConfigService {
       this.store.setMeta('exportSource', source);
       this.store.setMeta(REVISION_KEY, revision);
       this.store.setMeta(CHECK_KEY, checked);
-      return { status: 'success', config: projectConfig(source), revision, changedDestination, markedPending,
+      return { status: 'success', config: projectConfig(source), revision, changedDestination, markedPending, historicalOrderTableChanged,
+        orderScope: source.orderScope, groupTablesCreatedAutomatically: source.orderScope === 'community',
         changedProductDestination, productsMarkedPending, writeMode: 'manual_one_way_backup' };
     });
   }

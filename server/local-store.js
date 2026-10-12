@@ -4,11 +4,13 @@ import { dirname, resolve } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { DomainError, completeGroup, normalizePhone } from './order-service.js';
 import { billLines, cents, normalizeFeePolicy } from './order-billing.js';
+import { normalizeSplitRules, splitLine, splitAmount } from './split-groups.js';
+import { productPricing, pricingChanged, validPrice } from './product-pricing.js';
 
 export const ORDER_STATUSES = ['待采购', '已买到', '缺货', '已领取', '已取消'];
 const PRODUCT_ID = /^[\p{L}\p{N}][\p{L}\p{N}_-]{0,127}$/u;
 const EXCLUDED = new Set(['缺货', '已取消']);
-const PRODUCT_FIELDS = ['name', 'spec', 'unit', 'priceCents', 'category', 'onSale', 'sort', 'imageUrl'];
+const PRODUCT_FIELDS = ['name', 'spec', 'unit', 'priceCents', 'category', 'onSale', 'sort', 'imageUrl', 'originalPriceCents', 'pricing'];
 export function productVersion(product) {
   return createHash('sha256').update(JSON.stringify([
     product.id, product.name, product.spec, product.unit, product.priceCents, product.onSale,
@@ -17,6 +19,12 @@ export function productVersion(product) {
 export function payloadHash(payload) {
   return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }
+export function communityExportArchiveKey(destination, code) {
+  return `feishu-community-export-archive:${payloadHash([destination.baseToken, destination.orderTableId])}:${code}`;
+}
+const sameOrderDestination = (a, b) => Boolean(a?.baseToken && a?.orderTableId
+  && a.baseToken === b?.baseToken && a.orderTableId === b?.orderTableId);
+const pendingOrderCreates = meta => Boolean(meta?.pendingCreates && Object.keys(meta.pendingCreates).length);
 export function samsStoreKey(store) {
   return store ? JSON.stringify([store.cityCode, store.storeId, store.storeType]) : null;
 }
@@ -37,7 +45,7 @@ function productInput(product) {
   }
   return {
     id: product.id, recordId: product.recordId || null, name: product.name.trim(),
-    spec: product.spec.trim(), unit: product.unit.trim(), priceCents: product.priceCents,
+    spec: product.spec.trim(), unit: product.unit.trim(), ...productPricing(product),
     category: (typeof product.category === 'string' ? product.category.trim() : '') || '其他',
     onSale: product.onSale, sort: product.sort ?? 0, imageUrl,
     source: source === null ? null : JSON.parse(JSON.stringify(source)),
@@ -97,7 +105,7 @@ export class LocalStore {
         category TEXT NOT NULL, on_sale INTEGER NOT NULL CHECK(on_sale IN (0,1)),
         sort REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
         image_url TEXT, source_json TEXT, revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
-        created_at TEXT NOT NULL DEFAULT ''
+        created_at TEXT NOT NULL DEFAULT '', removed_at TEXT
       );
       CREATE TABLE IF NOT EXISTS communities (
         id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
@@ -109,8 +117,12 @@ export class LocalStore {
         product_ids_json TEXT NOT NULL, collecting INTEGER NOT NULL CHECK(collecting IN (0,1)),
         cutoff_at TEXT, pickup_location TEXT NOT NULL, pickup_at TEXT, contact_note TEXT NOT NULL,
         image_url_template TEXT NOT NULL, feishu_url TEXT, created_at TEXT NOT NULL,
-        sams_store_json TEXT, fee_policy_json TEXT,
+        sams_store_json TEXT, fee_policy_json TEXT, split_rules_json TEXT, deleted_at TEXT,
         UNIQUE(community_id, period_number)
+      );
+      CREATE TABLE IF NOT EXISTS split_settlements (
+        batch_code TEXT NOT NULL REFERENCES batches(code), product_id TEXT NOT NULL,
+        result_json TEXT NOT NULL, PRIMARY KEY(batch_code,product_id)
       );
       CREATE TABLE IF NOT EXISTS submissions (
         batch_code TEXT NOT NULL REFERENCES batches(code), submission_id TEXT NOT NULL,
@@ -147,16 +159,25 @@ export class LocalStore {
     `);
     this.transaction(() => {
       const columns = new Set(this.db.prepare('PRAGMA table_info(products)').all().map(column => column.name));
-      for (const [name, definition] of Object.entries({ image_url: 'TEXT', source_json: 'TEXT',
+      for (const [name, definition] of Object.entries({ image_url: 'TEXT', source_json: 'TEXT', original_price_cents: 'INTEGER', pricing_json: 'TEXT', removed_at: 'TEXT',
         revision: 'INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1)', created_at: "TEXT NOT NULL DEFAULT ''" })) {
         if (!columns.has(name)) this.db.exec(`ALTER TABLE products ADD COLUMN ${name} ${definition}`);
       }
       this.db.exec("UPDATE products SET created_at=updated_at WHERE created_at='' OR created_at IS NULL");
-      for (const [table, name, definition] of [['batches', 'sams_store_json', 'TEXT'], ['batches', 'fee_policy_json', 'TEXT'],
+      for (const [table, name, definition] of [['batches', 'sams_store_json', 'TEXT'], ['batches', 'fee_policy_json', 'TEXT'], ['batches', 'split_rules_json', 'TEXT'], ['batches', 'deleted_at', 'TEXT'],
         ['order_lines', 'snapshot_json', 'TEXT'], ['submissions', 'customer_hash', 'TEXT']]) {
         if (!this.db.prepare(`PRAGMA table_info(${table})`).all().some(column => column.name === name)) {
           this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
         }
+      }
+      // Capture historical orders before introducing editable retail pricing.
+      // Existing snapshot amounts and export revisions are left unchanged.
+      this.freezeLegacyOrderProducts();
+      const savePricing = this.db.prepare('UPDATE products SET original_price_cents=?,pricing_json=? WHERE product_id=?');
+      for (const row of this.db.prepare('SELECT * FROM products WHERE pricing_json IS NULL').all()) {
+        const source = row.source_json ? JSON.parse(row.source_json) : null;
+        savePricing.run(validPrice(source?.priceCents) ? source.priceCents : null,
+          JSON.stringify({ mode: 'fixed', markupBps: null }), row.product_id);
       }
     });
   }
@@ -189,20 +210,114 @@ export class LocalStore {
   setSyncStatus(key, value) {
     return arguments.length === 1 ? this.setMeta('syncStatus', key) : this.setMeta(key, value);
   }
+  getCommunityOrderTable(baseToken, communityId) {
+    return this.getMeta(`feishu-community-table:${baseToken}:${communityId}`);
+  }
+  setCommunityOrderTable(baseToken, communityId, value) {
+    if (typeof baseToken !== 'string' || !baseToken.trim() || typeof communityId !== 'string' || !communityId.trim()
+      || !value || typeof value !== 'object' || Array.isArray(value) || value.baseToken !== baseToken || value.communityId !== communityId
+      || !['ready', 'pending', 'error'].includes(value.status)
+      || value.tableId != null && (typeof value.tableId !== 'string' || !value.tableId.trim())
+      || value.tableName != null && (typeof value.tableName !== 'string' || !value.tableName.trim() || value.tableName.length > 200)
+      || value.status === 'ready' && !value.tableId) {
+      throw new DomainError(400, 'INVALID_COMMUNITY_ORDER_TABLE', '群订单表绑定资料无效。');
+    }
+    return this.setMeta(`feishu-community-table:${baseToken}:${communityId}`, value);
+  }
+  isCommunityOrderDestinationCurrent(code, batch = this.getBatch(code)) {
+    const source = this.getMeta('exportSource');
+    // Legacy/offline stores without a configured Base retain their existing
+    // revision semantics until a manual configuration or sync selects a target.
+    if (!source?.baseToken || source.orderScope === 'shared' || !batch?.communityId
+      || source.orderScope !== 'community' && !source.orderTableId) return true;
+    const binding = this.getCommunityOrderTable(source.baseToken, batch.communityId);
+    const meta = this.getMeta(`feishu-export:${code}`);
+    return binding?.status === 'ready' && meta?.scope === 'community'
+      && sameOrderDestination(meta.destination, { baseToken: source.baseToken, orderTableId: binding.tableId });
+  }
+  switchOrderExportDestination(code, destination, { scope = 'community', tableName = null } = {}) {
+    if (!destination || typeof destination !== 'object' || Array.isArray(destination)
+      || Object.keys(destination).some(key => !['baseToken', 'orderTableId'].includes(key))
+      || ['baseToken', 'orderTableId'].some(key => typeof destination[key] !== 'string' || !destination[key].trim())
+      || !['community', 'legacy'].includes(scope)
+      || tableName != null && (typeof tableName !== 'string' || !tableName.trim() || tableName.length > 200)) {
+      throw new DomainError(400, 'INVALID_ORDER_EXPORT_DESTINATION', '订单备份目标无效。');
+    }
+    return this.transaction(() => {
+      if (!this.getBatch(code, { includeDeleted: true })) throw new DomainError(404, 'BATCH_NOT_FOUND', '未找到这个团购。');
+      const key = `feishu-export:${code}`;
+      const stored = this.getMeta(key) || {};
+      const lines = this.db.prepare('SELECT line_id,revision,remote_record_id,synced_revision,export_error FROM order_lines WHERE batch_code=? ORDER BY id').all(code)
+        .map(row => ({ lineId: row.line_id, revision: row.revision, remoteRecordId: row.remote_record_id,
+          syncedRevision: row.synced_revision, syncError: row.export_error }));
+      let previous = stored;
+      const hadRemoteState = lines.some(line => line.remoteRecordId || line.syncedRevision || line.syncError)
+        || stored.lastSyncedAt || stored.viewUrl || pendingOrderCreates(stored) || stored.status === 'success'
+        || ['created', 'updated', 'unchanged'].some(key => stored.counts?.[key] > 0);
+      if (!stored.destination && hadRemoteState) {
+        const oldSource = this.getMeta('exportSource');
+        if (!oldSource?.baseToken || !oldSource.orderTableId) throw new DomainError(409, 'ORDER_EXPORT_DESTINATION_UNKNOWN', '旧订单同步目标无法确认，请先核对原飞书订单表；本地绑定保留。');
+        previous = { ...stored, destination: { baseToken: oldSource.baseToken, orderTableId: oldSource.orderTableId }, scope: 'legacy' };
+      }
+      if (sameOrderDestination(previous.destination, destination)) {
+        // Pinning a legacy destination is safe even with unresolved writes:
+        // reconciliation still runs against exactly that table and its bindings.
+        return this.setMeta(key, { ...previous, destination: { ...destination }, scope,
+          tableName: tableName || previous.tableName || null });
+      }
+      const targetArchive = this.getMeta(communityExportArchiveKey(destination, code));
+      if (pendingOrderCreates(previous) || pendingOrderCreates(targetArchive?.meta || targetArchive)
+        || targetArchive?.history?.some(row => pendingOrderCreates(row.meta))) {
+        throw new DomainError(409, 'ORDER_EXPORT_PENDING_CREATES', '存在尚未确认的飞书新增记录，请先在原订单表完成核查，再切换群订单表。');
+      }
+      if (previous.destination) {
+        const archiveKey = communityExportArchiveKey(previous.destination, code);
+        const existing = this.getMeta(archiveKey);
+        const archive = { destination: previous.destination, scope: previous.scope || 'legacy',
+          tableName: previous.tableName || previous.targetTableName || null, meta: previous, lines,
+          archivedAt: new Date().toISOString() };
+        if (existing) {
+          const { history = [], ...last } = existing;
+          archive.history = [...history, last];
+        }
+        this.setMeta(archiveKey, archive);
+      }
+      this.db.prepare('UPDATE order_lines SET remote_record_id=NULL,synced_revision=0,export_error=NULL WHERE batch_code=?').run(code);
+      return this.setMeta(key, { destination: { ...destination }, scope, tableName,
+        pendingCreates: {}, status: 'pending', lastSyncedAt: null, counts: null, error: null, viewUrl: null,
+        legacyViewUrl: previous.scope === 'legacy' ? previous.viewUrl || previous.legacyViewUrl || null : previous.legacyViewUrl || null });
+    });
+  }
 
   decodeProduct(row) {
     return row ? {
       id: row.product_id, recordId: row.record_id, name: row.name, spec: row.spec, unit: row.unit,
       priceCents: row.price_cents, category: row.category, onSale: Boolean(row.on_sale),
+      originalPriceCents: row.original_price_cents ?? null,
+      pricing: row.pricing_json ? JSON.parse(row.pricing_json) : { mode: 'fixed', markupBps: null },
       sort: row.sort, updatedAt: row.updated_at, imageUrl: row.image_url,
       source: row.source_json ? JSON.parse(row.source_json) : null,
-      revision: row.revision, createdAt: row.created_at,
+      revision: row.revision, createdAt: row.created_at, removedAt: row.removed_at || null,
     } : null;
   }
-  listProducts() {
-    return this.db.prepare('SELECT * FROM products ORDER BY sort, product_id').all().map(row => this.decodeProduct(row));
+  listProducts({ includeRemoved = false } = {}) {
+    return this.db.prepare(`SELECT * FROM products${includeRemoved ? '' : ' WHERE removed_at IS NULL'} ORDER BY sort, product_id`).all().map(row => this.decodeProduct(row));
   }
   getProduct(id) { return this.decodeProduct(this.db.prepare('SELECT * FROM products WHERE product_id = ?').get(id)); }
+
+  freezeLegacyOrderProducts(productId = null) {
+    const rows = this.db.prepare(`SELECT l.id,l.product_id AS legacy_product_id,p.* FROM order_lines l LEFT JOIN products p ON p.product_id=l.product_id
+      WHERE l.snapshot_json IS NULL${productId === null ? '' : ' AND l.product_id=?'}`).all(...(productId === null ? [] : [productId]));
+    const save = this.db.prepare('UPDATE order_lines SET snapshot_json=? WHERE id=? AND snapshot_json IS NULL');
+    for (const row of rows) {
+      const product = row.product_id === null ? null : this.decodeProduct(row);
+      save.run(JSON.stringify(product ? { id: product.id, name: product.name, spec: product.spec, unit: product.unit,
+        priceCents: product.priceCents, imageUrl: product.imageUrl,
+        description: product.source?.description || '', feeCategory: 'recommended', feeRateBps: 0 }
+        : { id: row.legacy_product_id, name: `商品 ${row.legacy_product_id}（资料缺失）`, spec: '', unit: '',
+          priceCents: null, imageUrl: null, description: '', missing: true, feeCategory: 'recommended', feeRateBps: 0 }), row.id);
+    }
+  }
 
   selectProducts(products, { timestamp = new Date().toISOString() } = {}) {
     if (!Array.isArray(products) || !products.length || products.length > 200) {
@@ -212,12 +327,13 @@ export class LocalStore {
     if (!Number.isFinite(Date.parse(timestamp))) throw new DomainError(400, 'INVALID_PRODUCT_TIME', '商品入库时间无效。');
     return this.transaction(() => {
       const insert = this.db.prepare(`INSERT INTO products
-        (product_id,record_id,name,spec,unit,price_cents,category,on_sale,sort,updated_at,image_url,source_json,revision,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,?) ON CONFLICT(product_id) DO NOTHING`);
+        (product_id,record_id,name,spec,unit,price_cents,category,on_sale,sort,updated_at,image_url,source_json,revision,created_at,original_price_cents,pricing_json)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?) ON CONFLICT(product_id) DO NOTHING`);
       let added = 0;
       for (const product of normalized) {
         added += Number(insert.run(product.id, null, product.name, product.spec, product.unit, product.priceCents,
-          product.category, 0, product.sort, timestamp, product.imageUrl, JSON.stringify(product.source), timestamp).changes);
+          product.category, 0, product.sort, timestamp, product.imageUrl, JSON.stringify(product.source), timestamp,
+          product.source.priceCents, JSON.stringify({ mode: 'markup', markupBps: 0 })).changes);
       }
       const ids = [...new Set(normalized.map(product => product.id))];
       return { added, skipped: normalized.length - added, products: ids.map(id => this.getProduct(id)) };
@@ -272,34 +388,50 @@ export class LocalStore {
   addCustomerCatalogProduct(product, timestamp = new Date().toISOString()) {
     const normalized = productInput(product);
     if (normalized.source?.customerSelected !== true) throw new DomainError(400, 'INVALID_PRODUCT_SELECTION', '顾客自选来源不完整。');
-    this.db.prepare(`INSERT INTO products(product_id,record_id,name,spec,unit,price_cents,category,on_sale,sort,updated_at,image_url,source_json,revision,created_at)
-      VALUES(?,?,?,?,?,?,?,0,?,?,?,?,1,?) ON CONFLICT(product_id) DO NOTHING`).run(normalized.id, null, normalized.name,
+    const base = validPrice(normalized.source.priceCents) ? normalized.source.priceCents : normalized.priceCents;
+    const pricing = normalized.priceCents === base ? { mode: 'markup', markupBps: 0 } : { mode: 'fixed', markupBps: null };
+    this.db.prepare(`INSERT INTO products(product_id,record_id,name,spec,unit,price_cents,category,on_sale,sort,updated_at,image_url,source_json,revision,created_at,original_price_cents,pricing_json)
+      VALUES(?,?,?,?,?,?,?,0,?,?,?,?,1,?,?,?) ON CONFLICT(product_id) DO NOTHING`).run(normalized.id, null, normalized.name,
       normalized.spec, normalized.unit, normalized.priceCents, normalized.category, normalized.sort, timestamp,
-      normalized.imageUrl, JSON.stringify(normalized.source), timestamp);
+      normalized.imageUrl, JSON.stringify(normalized.source), timestamp,
+      base, JSON.stringify(pricing));
     return this.getProduct(normalized.id);
   }
 
-  updateProduct(id, patch, { timestamp = new Date().toISOString() } = {}) {
+  updateProduct(id, patch, { timestamp = new Date().toISOString(), expectedRevision, sourcePriceSnapshot } = {}) {
     if (!patch || typeof patch !== 'object' || Array.isArray(patch) || !Object.keys(patch).length
       || Object.keys(patch).some(key => !PRODUCT_FIELDS.includes(key))) {
-      throw new DomainError(400, 'INVALID_PRODUCT_FIELDS', '只能修改商品名称、规格、单位、价格、分类、在售、排序和图片。');
+      throw new DomainError(400, 'INVALID_PRODUCT_FIELDS', '只能修改商品资料、原价及定价规则，商品来源不能由客户端修改。');
     }
     if (!Number.isFinite(Date.parse(timestamp))) throw new DomainError(400, 'INVALID_PRODUCT_TIME', '商品修改时间无效。');
     return this.transaction(() => {
       const previous = this.getProduct(id);
       if (!previous) throw new DomainError(404, 'PRODUCT_NOT_FOUND', '未找到这个商品。');
+      if (previous.removedAt) throw new DomainError(409, 'PRODUCT_REMOVED', '该商品已移除，请先手动恢复后再编辑或上架。', { productIds: [id] });
+      if (expectedRevision !== undefined && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)) {
+        throw new DomainError(400, 'INVALID_PRODUCT_REVISION', '商品修订版本无效，请刷新后重试。');
+      }
+      if (expectedRevision !== undefined && previous.revision !== expectedRevision) {
+        throw new DomainError(409, 'PRODUCT_REVISION_CONFLICT', '商品已被修改，请刷新后重新确认。', { productIds: [id] });
+      }
       if ((Object.hasOwn(patch, 'category') && (typeof patch.category !== 'string' || !patch.category.trim() || patch.category.length > 80))
         || (Object.hasOwn(patch, 'sort') && !Number.isFinite(patch.sort))) {
         throw new DomainError(400, 'INVALID_PRODUCT_SNAPSHOT', '商品分类或排序无效。');
       }
-      const product = productInput({ ...previous, ...patch });
-      if (!PRODUCT_FIELDS.some(key => previous[key] !== product[key])) return previous;
-      if (['name', 'spec', 'unit', 'priceCents'].some(key => previous[key] !== product[key])) {
-        this.db.prepare('UPDATE order_lines SET revision=revision+1, export_error=NULL WHERE product_id=? AND snapshot_json IS NULL').run(id);
-      }
+      // A legacy direct price edit means fixed retail pricing. Markup edits are
+      // always calculated from the original price on the server.
+      const implicitFixed = Object.hasOwn(patch, 'priceCents') && !Object.hasOwn(patch, 'pricing');
+      const product = productInput({ ...previous, ...patch,
+        ...(implicitFixed ? { pricing: { mode: 'fixed', markupBps: null } } : {}),
+        ...(sourcePriceSnapshot ? { source: { ...previous.source,
+          latestPriceCents: sourcePriceSnapshot.priceCents, latestQueriedAt: sourcePriceSnapshot.queriedAt } } : {}) });
+      const changed = pricingChanged(previous, product) || PRODUCT_FIELDS.filter(key => !['pricing', 'originalPriceCents', 'priceCents'].includes(key)).some(key => previous[key] !== product[key]);
+      if (!changed && !sourcePriceSnapshot) return previous;
+      this.freezeLegacyOrderProducts(id);
       this.db.prepare(`UPDATE products SET name=?,spec=?,unit=?,price_cents=?,category=?,on_sale=?,sort=?,
-        image_url=?,revision=revision+1,updated_at=? WHERE product_id=?`).run(product.name, product.spec,
-        product.unit, product.priceCents, product.category, Number(product.onSale), product.sort, product.imageUrl, timestamp, id);
+        image_url=?,original_price_cents=?,pricing_json=?,source_json=?,revision=revision+1,updated_at=? WHERE product_id=?`).run(product.name, product.spec,
+        product.unit, product.priceCents, product.category, Number(product.onSale), product.sort, product.imageUrl,
+        product.originalPriceCents, JSON.stringify(product.pricing), product.source ? JSON.stringify(product.source) : null, timestamp, id);
       return this.getProduct(id);
     });
   }
@@ -320,6 +452,8 @@ export class LocalStore {
       const previous = ids.map(id => this.getProduct(id));
       const missing = ids.filter((id, index) => !previous[index]);
       if (missing.length) throw new DomainError(404, 'PRODUCT_NOT_FOUND', '部分商品已不存在，请刷新商品库后重试。', { productIds: missing });
+      const removed = previous.filter(product => product.removedAt).map(product => product.id);
+      if (removed.length) throw new DomainError(409, 'PRODUCT_REMOVED', '部分商品已移除，请先手动恢复后再调整在售状态。', { productIds: removed });
       let updated = 0;
       const products = previous.map(product => {
         if (product.onSale === input.onSale) return product;
@@ -327,6 +461,40 @@ export class LocalStore {
         return this.updateProduct(product.id, { onSale: input.onSale }, { timestamp });
       });
       return { updated, unchanged: ids.length - updated, products };
+    });
+  }
+
+  removeProducts(input, { timestamp = new Date().toISOString() } = {}) {
+    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => key !== 'productIds')
+      || !Array.isArray(input.productIds) || !input.productIds.length || input.productIds.length > 200
+      || new Set(input.productIds).size !== input.productIds.length
+      || input.productIds.some(id => typeof id !== 'string' || !PRODUCT_ID.test(id))) {
+      throw new DomainError(400, 'INVALID_PRODUCT_REMOVE', '请选择 1 至 200 种不重复商品移除。');
+    }
+    if (!Number.isFinite(Date.parse(timestamp))) throw new DomainError(400, 'INVALID_PRODUCT_TIME', '商品修改时间无效。');
+    return this.transaction(() => {
+      const products = input.productIds.map(id => this.getProduct(id));
+      const missing = input.productIds.filter((id, i) => !products[i]);
+      if (missing.length) throw new DomainError(404, 'PRODUCT_NOT_FOUND', '部分商品不存在，整批未移除，请刷新后重试。', { productIds: missing });
+      let updated = 0;
+      for (const product of products) if (!product.removedAt) {
+        this.freezeLegacyOrderProducts(product.id);
+        this.db.prepare('UPDATE products SET removed_at=?,on_sale=0,revision=revision+1,updated_at=? WHERE product_id=?')
+          .run(timestamp, timestamp, product.id);
+        updated += 1;
+      }
+      return { products: products.map(product => this.getProduct(product.id)), removed: true,
+        updated, unchanged: products.length - updated };
+    });
+  }
+  restoreProduct(id, { timestamp = new Date().toISOString() } = {}) {
+    if (!Number.isFinite(Date.parse(timestamp))) throw new DomainError(400, 'INVALID_PRODUCT_TIME', '商品修改时间无效。');
+    return this.transaction(() => {
+      const product = this.getProduct(id);
+      if (!product) throw new DomainError(404, 'PRODUCT_NOT_FOUND', '未找到这个商品。');
+      if (product.removedAt) this.db.prepare('UPDATE products SET removed_at=NULL,on_sale=0,revision=revision+1,updated_at=? WHERE product_id=?')
+        .run(timestamp, id);
+      return this.getProduct(id);
     });
   }
 
@@ -339,32 +507,36 @@ export class LocalStore {
     const timestamp = lastSyncedAt || syncedAt || new Date().toISOString();
     if (!Number.isFinite(Date.parse(timestamp))) throw new DomainError(400, 'INVALID_SYNC_TIME', '同步时间无效。');
     return this.transaction(() => {
-      const existing = new Map(this.listProducts().map(product => [product.id, product]));
+      const existing = new Map(this.listProducts({ includeRemoved: true }).map(product => [product.id, product]));
       const incoming = new Set(normalized.map(product => product.id));
       let added = 0;
       let updated = 0;
       let disabled = 0;
       const upsert = this.db.prepare(`INSERT INTO products
-        (product_id, record_id, name, spec, unit, price_cents, category, on_sale, sort, updated_at,image_url,source_json,revision,created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,?,?,?,?)
+        (product_id, record_id, name, spec, unit, price_cents, category, on_sale, sort, updated_at,image_url,source_json,revision,created_at,original_price_cents,pricing_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,?,?,?,?,?,?)
         ON CONFLICT(product_id) DO UPDATE SET record_id=excluded.record_id, name=excluded.name,
         spec=excluded.spec, unit=excluded.unit, price_cents=excluded.price_cents, category=excluded.category,
         on_sale=excluded.on_sale, sort=excluded.sort, updated_at=excluded.updated_at,
-        image_url=excluded.image_url,source_json=excluded.source_json,revision=excluded.revision`);
+        image_url=excluded.image_url,source_json=excluded.source_json,revision=excluded.revision,
+        original_price_cents=excluded.original_price_cents,pricing_json=excluded.pricing_json`);
       for (const product of normalized) {
         const previous = existing.get(product.id);
-        const changed = previous && (['recordId', ...PRODUCT_FIELDS].some(key => previous[key] !== product[key])
+        if (previous?.removedAt) continue;
+        const changed = previous && (['recordId', ...PRODUCT_FIELDS.filter(key => key !== 'pricing')].some(key => previous[key] !== product[key])
+          || JSON.stringify(previous.pricing) !== JSON.stringify(product.pricing)
           || JSON.stringify(previous.source) !== JSON.stringify(product.source));
         if (!previous) added += 1;
         else if (changed) updated += 1;
         if (previous?.onSale && !product.onSale) disabled += 1;
         if (previous && ['name', 'spec', 'unit', 'priceCents'].some(key => previous[key] !== product[key])) {
-          this.db.prepare('UPDATE order_lines SET revision=revision+1, export_error=NULL WHERE product_id = ? AND snapshot_json IS NULL').run(product.id);
+          this.freezeLegacyOrderProducts(product.id);
         }
         upsert.run(product.id, product.recordId, product.name, product.spec, product.unit,
           product.priceCents, product.category || '其他', product.onSale ? 1 : 0, product.sort, timestamp,
           product.imageUrl, product.source ? JSON.stringify(product.source) : null,
-          previous ? previous.revision + Number(Boolean(changed)) : 1, previous?.createdAt || timestamp);
+          previous ? previous.revision + Number(Boolean(changed)) : 1, previous?.createdAt || timestamp,
+          product.originalPriceCents, JSON.stringify(product.pricing));
       }
       for (const product of existing.values()) {
         if (!incoming.has(product.id) && product.onSale) {
@@ -413,17 +585,20 @@ export class LocalStore {
       cutoffAt: row.cutoff_at, pickupLocation: row.pickup_location, pickupAt: row.pickup_at,
       contactNote: row.contact_note, imageUrlTemplate: row.image_url_template,
       feishuUrl: row.feishu_url, createdAt: row.created_at, managed: true,
+      deletedAt: row.deleted_at || null,
       samsStore: row.sams_store_json ? JSON.parse(row.sams_store_json) : null,
       feePolicy: normalizeFeePolicy(row.fee_policy_json ? JSON.parse(row.fee_policy_json) : undefined),
+      splitRules: normalizeSplitRules(row.split_rules_json ? JSON.parse(row.split_rules_json) : undefined),
     };
   }
-  listBatches() {
+  listBatches({ includeDeleted = false } = {}) {
     return this.db.prepare(`SELECT b.*,c.name AS community_name FROM batches b
-      JOIN communities c ON c.id=b.community_id ORDER BY b.created_at DESC, b.rowid DESC`).all().map(row => this.decodeBatch(row));
+      JOIN communities c ON c.id=b.community_id${includeDeleted ? '' : ' WHERE b.deleted_at IS NULL'}
+      ORDER BY b.created_at DESC, b.rowid DESC`).all().map(row => this.decodeBatch(row));
   }
-  getBatch(code) {
+  getBatch(code, { includeDeleted = false } = {}) {
     return this.decodeBatch(this.db.prepare(`SELECT b.*,c.name AS community_name FROM batches b
-      JOIN communities c ON c.id=b.community_id WHERE b.code=?`).get(code));
+      JOIN communities c ON c.id=b.community_id WHERE b.code=?${includeDeleted ? '' : ' AND b.deleted_at IS NULL'}`).get(code));
   }
   getBatchByRequest(requestId) {
     return this.decodeBatch(this.db.prepare(`SELECT b.*,c.name AS community_name FROM batches b
@@ -431,8 +606,9 @@ export class LocalStore {
   }
   createBatch(input) {
     return this.transaction(() => {
-      const existing = input.requestId ? this.getBatchByRequest(input.requestId) : this.getBatch(input.code);
+      const existing = input.requestId ? this.getBatchByRequest(input.requestId) : this.getBatch(input.code, { includeDeleted: true });
       if (existing) {
+        if (existing.deletedAt) throw new DomainError(409, 'BATCH_REQUEST_DELETED', '该期次已删除，请从已删除期次恢复，不能重复创建。');
         if (input.requestHash && existing.requestHash !== input.requestHash) throw new DomainError(409, 'BATCH_REQUEST_CONFLICT', '该创建编号已经用于另一份团购。');
         return existing;
       }
@@ -444,35 +620,60 @@ export class LocalStore {
       const code = input.code || `gb-${input.requestId}`;
       this.db.prepare(`INSERT INTO batches
         (code,community_id,period_number,request_id,request_hash,title,description,product_ids_json,
-         collecting,cutoff_at,pickup_location,pickup_at,contact_note,image_url_template,feishu_url,created_at,sams_store_json,fee_policy_json)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+         collecting,cutoff_at,pickup_location,pickup_at,contact_note,image_url_template,feishu_url,created_at,sams_store_json,fee_policy_json,split_rules_json)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
         code, community.id, periodNumber, input.requestId || null, input.requestHash || null,
         input.title || `${community.name} · 第${periodNumber}期`, input.description || '',
         JSON.stringify(input.productIds || []), input.collecting === false ? 0 : 1,
         input.cutoffAt || null, input.pickupLocation || '', input.pickupAt || null,
         input.contactNote || '', input.imageUrlTemplate || '/images/{id}/cover.svg',
         input.feishuUrl || null, input.createdAt || new Date().toISOString(), input.samsStore ? JSON.stringify(input.samsStore) : null,
-        JSON.stringify(normalizeFeePolicy(input.feePolicy)),
+        JSON.stringify(normalizeFeePolicy(input.feePolicy)), JSON.stringify(normalizeSplitRules(input.splitRules)),
       );
-      if (!this.getMeta('defaultBatch')) this.setMeta('defaultBatch', code);
+      if (!this.getBatch(this.getMeta('defaultBatch'))) this.setMeta('defaultBatch', code);
       return this.getBatch(code);
     });
   }
   updateBatch(code, patch) {
     const columns = { title: 'title', description: 'description', productIds: 'product_ids_json',
       collecting: 'collecting', cutoffAt: 'cutoff_at', pickupLocation: 'pickup_location',
-      pickupAt: 'pickup_at', contactNote: 'contact_note', samsStore: 'sams_store_json', feePolicy: 'fee_policy_json' };
+      pickupAt: 'pickup_at', contactNote: 'contact_note', samsStore: 'sams_store_json', feePolicy: 'fee_policy_json', splitRules: 'split_rules_json' };
     const assignments = [];
     const values = [];
     for (const [key, value] of Object.entries(patch)) {
       if (!columns[key]) throw new DomainError(400, 'INVALID_BATCH_FIELDS', '小区归属与期数不能修改。');
       assignments.push(`${columns[key]}=?`);
-      values.push(key === 'feePolicy' ? JSON.stringify(normalizeFeePolicy(value))
+      values.push(key === 'splitRules' ? JSON.stringify(normalizeSplitRules(value)) : key === 'feePolicy' ? JSON.stringify(normalizeFeePolicy(value))
         : key === 'productIds' || key === 'samsStore' ? (value === null ? null : JSON.stringify(value)) : key === 'collecting' ? Number(value) : value);
     }
     if (!this.getBatch(code)) throw new DomainError(404, 'BATCH_NOT_FOUND', '未找到这个团购。');
     if (assignments.length) this.db.prepare(`UPDATE batches SET ${assignments.join(',')} WHERE code=?`).run(...values, code);
     return this.getBatch(code);
+  }
+  refreshDefaultBatch() {
+    if (!this.getBatch(this.getMeta('defaultBatch'))) this.setMeta('defaultBatch', this.listBatches()[0]?.code || null);
+  }
+  deleteBatch(code, { now = Date.now(), timestamp = new Date(now).toISOString() } = {}) {
+    return this.transaction(() => {
+      const batch = this.getBatch(code, { includeDeleted: true });
+      if (!batch) throw new DomainError(404, 'BATCH_NOT_FOUND', '未找到这个团购。');
+      if (batch.deletedAt) return batch;
+      if (batch.collecting && (!batch.cutoffAt || Date.parse(batch.cutoffAt) > now)) {
+        throw new DomainError(409, 'BATCH_DELETE_OPEN', '本期仍在收集订单，请先截单再删除。');
+      }
+      this.db.prepare('UPDATE batches SET deleted_at=? WHERE code=? AND deleted_at IS NULL').run(timestamp, code);
+      this.refreshDefaultBatch();
+      return this.getBatch(code, { includeDeleted: true });
+    });
+  }
+  restoreBatch(code) {
+    return this.transaction(() => {
+      const batch = this.getBatch(code, { includeDeleted: true });
+      if (!batch) throw new DomainError(404, 'BATCH_NOT_FOUND', '未找到这个团购。');
+      if (batch.deletedAt) this.db.prepare('UPDATE batches SET deleted_at=NULL,collecting=0 WHERE code=?').run(code);
+      this.refreshDefaultBatch();
+      return this.getBatch(code);
+    });
   }
 
   getSubmission(code, id) {
@@ -523,6 +724,9 @@ export class LocalStore {
       if (!current) throw new DomainError(404, 'ORDER_NOT_FOUND', '本期未找到该订单明细。');
       const quantity = Object.hasOwn(patch, 'quantity') ? patch.quantity : current.quantity;
       const status = Object.hasOwn(patch, 'status') ? patch.status : current.status;
+      if (current.snapshot?.split && this.getSplitSettlement(code, current.productId) && quantity !== current.quantity) {
+        throw new DomainError(409, 'SPLIT_QUANTITY_LOCKED', '拼份已确认采购，不能修改请求份数；可调整采购状态。');
+      }
       if (!Number.isSafeInteger(quantity) || quantity < 0 || quantity > 999 || !ORDER_STATUSES.includes(status)) {
         throw new DomainError(400, 'INVALID_ORDER_UPDATE', '数量需为 0 至 999 的整数，状态需为预设状态。');
       }
@@ -538,25 +742,47 @@ export class LocalStore {
     const mark = this.db.prepare('UPDATE order_lines SET revision=revision+1,export_error=NULL WHERE batch_code=? AND line_id=?');
     for (const line of this.listExportLines(code)) {
       const old = previous.get(line.lineId);
-      if (old && old.feeCents !== line.feeCents && !alreadyChanged.has(line.lineId)) mark.run(code, line.lineId);
+      if (old && (old.feeCents !== line.feeCents || old.amountCents !== line.amountCents) && !alreadyChanged.has(line.lineId)) mark.run(code, line.lineId);
     }
   }
 
   listExportLines(code, { onlyDirty = false } = {}) {
     const batch = this.getBatch(code);
     if (!batch) throw new DomainError(404, 'BATCH_NOT_FOUND', '未找到这个团购。');
-    const products = new Map(this.listProducts().map(product => [product.id, product]));
+    const products = new Map(this.listProducts({ includeRemoved: true }).map(product => [product.id, product]));
     const lines = this.listOrderLines(code).map(line => {
       const product = line.snapshot || products.get(line.productId);
+      const split = line.snapshot?.split ? splitLine(line, this.getSplitSettlement(code, line.productId)) : undefined;
+      const billableQuantity = split ? split.formedQuantity : line.quantity;
       return {
         ...line, version: line.revision, syncedVersion: line.syncedRevision,
         communityName: batch.communityName, periodNumber: batch.periodNumber, periodLabel: batch.periodLabel,
         product: product || null, productName: product?.name || `商品 ${line.productId}（资料缺失）`,
         spec: product?.spec || '', unit: product?.unit || '', priceCents: product?.priceCents ?? null,
-        amountCents: EXCLUDED.has(line.status) ? 0 : product ? cents(BigInt(product.priceCents) * BigInt(line.quantity)) : null,
+        ...(split ? { split, pendingQuantity: split.pendingQuantity,
+          pendingGoodsCents: splitAmount(product.priceCents, split.pendingQuantity) } : {}),
+        amountCents: EXCLUDED.has(line.status) ? 0 : product?.priceCents == null ? null
+          : cents(BigInt(product.priceCents) * BigInt(billableQuantity)),
       };
     });
-    return billLines(lines).filter(line => !onlyDirty || line.revision !== line.syncedRevision);
+    const destinationChanged = onlyDirty && !this.isCommunityOrderDestinationCurrent(code, batch);
+    return billLines(lines).filter(line => !onlyDirty || destinationChanged || line.revision !== line.syncedRevision);
+  }
+  getSplitSettlement(code, productId) {
+    const row = this.db.prepare('SELECT result_json FROM split_settlements WHERE batch_code=? AND product_id=?').get(code, productId);
+    return row ? JSON.parse(row.result_json) : null;
+  }
+  saveSplitSettlement(code, productId, result) {
+    return this.transaction(() => {
+      const before = this.listExportLines(code);
+      this.db.prepare('INSERT INTO split_settlements(batch_code,product_id,result_json) VALUES(?,?,?)')
+        .run(code, productId, JSON.stringify(result));
+      const changed = new Set(this.listOrderLines(code).filter(line => line.productId === productId && line.snapshot?.split).map(line => line.lineId));
+      this.db.prepare('UPDATE order_lines SET revision=revision+1,export_error=NULL WHERE batch_code=? AND product_id=?')
+        .run(code, productId);
+      this.markBillingChanges(code, before, changed);
+      return result;
+    });
   }
   getExportSnapshot(code) { return { batch: this.getBatch(code), lines: this.listExportLines(code) }; }
   markExported(code, lineId, revision, remoteRecordId) {
@@ -587,7 +813,7 @@ export class LocalStore {
 
   importLegacyBatch(config, settings, products, lines) {
     return this.transaction(() => {
-      const existing = this.getBatch(config.code);
+      const existing = this.getBatch(config.code, { includeDeleted: true });
       if (existing) return { batch: existing, imported: false, orderLines: 0 };
       const normalized = products.map(productInput);
       if (!this.listProducts().length) this.importProducts(normalized, { source: config });

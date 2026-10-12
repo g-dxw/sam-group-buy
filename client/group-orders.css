@@ -1,0 +1,167 @@
+.admin-group-order-target {
+  min-width: 0;
+  margin-bottom: 24px;
+  padding: 18px 22px;
+  border: 1px solid var(--admin-border);
+  border-radius: 12px;
+  background: #fff;
+}
+
+.admin-group-order-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.admin-group-order-heading > div {
+  min-width: 0;
+}
+
+.admin-group-order-heading p {
+  margin-bottom: 4px;
+  color: var(--admin-muted);
+  font-size: 12px;
+}
+
+.admin-group-order-heading h3 {
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.admin-group-order-help,
+.admin-group-order-error {
+  margin-top: 8px;
+  color: var(--admin-muted);
+  font-size: 12px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+
+.admin-group-order-target.is-error {
+  border-color: #ebd5ce;
+}
+
+.admin-group-order-target.is-error .admin-pill {
+  color: var(--admin-danger);
+  background: #fff0eb;
+}
+
+.admin-group-order-error {
+  color: var(--admin-danger);
+}
+
+.admin-group-order-footer,
+.admin-group-order-legacy {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 20px;
+  margin-top: 8px;
+  color: var(--admin-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.admin-group-order-links {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+
+.admin-root .admin-group-order-target .admin-link {
+  min-height: 44px;
+  font-size: 12px;
+  text-align: left;
+}
+
+.admin-group-order-legacy {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--admin-border);
+}
+
+.feishu-order-scope {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 22px;
+  padding: 15px 16px;
+  border: 1px solid #dce8da;
+  border-radius: 10px;
+  background: var(--admin-soft);
+}
+
+.feishu-order-scope > svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--admin-green);
+}
+
+.feishu-order-scope > div {
+  min-width: 0;
+}
+
+.feishu-order-scope strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.feishu-order-scope p {
+  margin-top: 5px;
+  color: var(--admin-muted);
+  font-size: 12px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 480px) {
+  .admin-group-order-target {
+    padding: 16px;
+  }
+
+  .admin-group-order-heading {
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .admin-group-order-heading h3 {
+    font-size: 15px;
+  }
+
+  .admin-group-order-footer,
+  .admin-group-order-legacy {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 12px;
+  }
+
+  .admin-group-order-links {
+    width: 100%;
+    gap: 2px 12px;
+  }
+
+  .admin-root .admin-group-order-target .admin-link {
+    justify-content: flex-start;
+    padding-left: 0;
+    padding-right: 0;
+  }
+
+  .feishu-order-scope {
+    gap: 10px;
+    padding: 13px;
+  }
+
+  .feishu-flow-banner > div:last-child {
+    min-width: 0;
+  }
+
+  .feishu-flow-banner > div:last-child strong {
+    overflow-wrap: anywhere;
+  }
+}

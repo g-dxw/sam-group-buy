@@ -159,6 +159,25 @@ export class SamsCatalog {
     return products;
   }
 
+  async sourcePrice(source) {
+    if (!source || source.platform !== 'samsclub_cn' || typeof source.spuId !== 'string' || !SPU_ID.test(source.spuId)
+      || typeof source.storeId !== 'string' || !/^\d{1,12}$/.test(source.storeId) || ![2, 4, 8, 256].includes(source.storeType)) {
+      throw new DomainError(400, 'INVALID_PRODUCT_SOURCE', '该商品没有可核验的山姆门店来源，请手动填写原价。');
+    }
+    const { result, queried_at } = await this.upstream('goods-portal/spuStoreModel/querySpuDetailToNFC', {
+      spuIdList: [source.spuId], visitStoreId: source.storeId,
+      storeInfoList: [{ storeType: source.storeType, storeId: source.storeId }], locationSwitch: false,
+    }, 0);
+    const row = result.data;
+    if (!row || Array.isArray(row) || String(row.spuId) !== source.spuId || String(row.storeId) !== source.storeId
+      || (row.storeType != null && Number(row.storeType) !== source.storeType)) {
+      throw new DomainError(502, 'SAMS_SOURCE_MISMATCH', '商品详情与原采集门店或商品不一致，未更新原价。');
+    }
+    const priceCents = salesPrice(row.priceInfo);
+    if (priceCents === null) throw new DomainError(502, 'SAMS_PRICE_UNAVAILABLE', '该门店商品没有有效价格，未更新原价。');
+    return { priceCents, queriedAt: queried_at };
+  }
+
   selectionSnapshot(snapshot) {
     const selectionId = randomUUID();
     for (const [key, snapshot] of this.snapshots) if (this.now() - snapshot.at >= SNAPSHOT_TTL) this.snapshots.delete(key);

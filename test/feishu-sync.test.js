@@ -55,10 +55,10 @@ function remote() {
   };
   return api;
 }
-const syncer = (store, api, extra = {}) => new FeishuSync({ store, sourceConfig: source, larkCall: api.larkCall,
+const syncer = (store, api, extra = {}) => new FeishuSync({ store, communityTables: false, sourceConfig: source, larkCall: api.larkCall,
   readRecordsCall: api.readRecordsCall, backoffMs: [], createBatchViews: false, ...extra });
 
-test('旧无快照订单首次写入后整单确认；重复无追加，取消和改价使用本地当前版本', async () => {
+test('旧无快照订单首次写入后整单确认；调价冻结旧金额，取消仍同步本地版本', async () => {
   const { store, batch } = fixture(); const api = remote(); const sync = syncer(store, api);
   assert.equal((await sync.syncOrders(batch.code)).status, 'success');
   assert.equal(api.rows.length, 1);
@@ -68,8 +68,8 @@ test('旧无快照订单首次写入后整单确认；重复无追加，取消�
   assert.equal(api.createdCalls, 1);
   store.importProducts([{ ...product('P1'), priceCents: 1500 }, product('P2')]);
   assert.equal((await sync.syncOrders(batch.code)).status, 'success');
-  assert.equal(api.rows[0].fields['同步单价'], 15);
-  assert.equal(api.rows[0].fields['同步金额'], 30);
+  assert.equal(api.rows[0].fields['同步单价'], 10);
+  assert.equal(api.rows[0].fields['同步金额'], 20);
   store.updateOrder(batch.code, 'submission-test:P1', { status: '已取消' });
   assert.equal((await sync.syncOrders(batch.code)).status, 'success');
   assert.deepEqual(api.rows[0].fields['处理状态'], ['已取消']);

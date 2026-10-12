@@ -25,10 +25,12 @@ const releaseLock = await acquireRuntimeLock(dataDir);
 process.on('exit', releaseLock);
 const store = new LocalStore({ path: resolve(dataDir, 'orders.sqlite') });
 const repository = new FeishuRepository();
-const service = new LocalService({ store });
 const auth = await new AdminAuth({ dataDir, password: process.env.ADMIN_PASSWORD }).initialize();
 const jobs = new SyncJobs();
 const sams = new SamsCatalog({ hasProduct: id => Boolean(store.getProduct(id)) });
+const service = new LocalService({ store, sams,
+  batchMutationBusy: code => jobs.active.has(`orders:${code}`) || jobs.active.has('feishu-save'),
+  productMutationBusy: () => jobs.active.has('products') || jobs.active.has('feishu-save') });
 const customerSelection = new CustomerSelection({ store, service, sams });
 const dev = process.argv.includes('--dev');
 const host = process.env.HOST || '127.0.0.1';
@@ -125,6 +127,10 @@ async function api(req, res, url) {
   if (url.pathname === '/api/health' && req.method === 'GET') {
     return sendJson(res, 200, { status: 'ok', database: { connected: true }, feishu: { mode: 'manual_one_way_backup', configured: Boolean(store.getMeta('exportSource')) } });
   }
+  if (url.pathname === '/api/batches') {
+    if (req.method === 'GET') return sendJson(res, 200, service.listPublicBatches());
+    return sendJson(res, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: '此操作不支持该请求方式。' } });
+  }
   if (url.pathname.startsWith('/api/admin/')) return adminApi(req, res, url);
   const match = url.pathname.match(/^\/api\/batches\/([^/]+)\/(catalog|orders|query|quote|sams\/search|customer-products|submissions\/([^/]+))$/);
   if (!match) return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: '没有找到这个接口。' } });
@@ -204,8 +210,19 @@ async function adminApi(req, res, url) {
   if (endpoint === 'products/status' && req.method === 'POST') {
     return sendJson(res, 200, service.updateProductStatus(await readJson(req)));
   }
+  if (endpoint === 'products/remove' && req.method === 'POST') return sendJson(res, 200, service.removeProducts(await readJson(req)));
+  if (endpoint === 'products/pricing/preview' && req.method === 'POST') return sendJson(res, 200, service.previewProductPricing(await readJson(req)));
+  if (endpoint === 'products/pricing/apply' && req.method === 'POST') return sendJson(res, 200, service.applyProductPricing(await readJson(req)));
+  const sourcePriceMatch = endpoint.match(/^products\/([^/]+)\/source-price$/);
+  if (sourcePriceMatch && req.method === 'GET') {
+    rateLimit(req, 'sams-query');
+    return sendJson(res, 200, await service.sourceProductPrice(decodeURIComponent(sourcePriceMatch[1])));
+  }
   const productMatch = endpoint.match(/^products\/([^/]+)$/);
   if (productMatch && req.method === 'PATCH') return sendJson(res, 200, service.updateProduct(decodeURIComponent(productMatch[1]), await readJson(req)));
+  if (productMatch && req.method === 'DELETE') return sendJson(res, 200, service.removeProduct(decodeURIComponent(productMatch[1]), await readJson(req)));
+  const restoreProductMatch = endpoint.match(/^products\/([^/]+)\/restore$/);
+  if (restoreProductMatch && req.method === 'POST') return sendJson(res, 200, service.restoreProduct(decodeURIComponent(restoreProductMatch[1]), await readJson(req)));
   if (endpoint === 'feishu/config' && req.method === 'GET') return sendJson(res, 200, feishuConfig.get());
   if (endpoint === 'feishu/config' && req.method === 'PUT') {
     const body = await readJson(req);
@@ -241,9 +258,14 @@ async function adminApi(req, res, url) {
   }
   const jobMatch = endpoint.match(/^jobs\/([a-zA-Z0-9-]+)$/);
   if (jobMatch && req.method === 'GET') return sendJson(res, 200, jobs.get(jobMatch[1]));
+  const splitMatch = endpoint.match(/^batches\/([^/]+)\/split\/([^/]+)\/confirm$/);
+  if (splitMatch && req.method === 'POST') return sendJson(res, 200, service.confirmSplit(decodeURIComponent(splitMatch[1]), decodeURIComponent(splitMatch[2]), await readJson(req)));
+  const restoreMatch = endpoint.match(/^batches\/([^/]+)\/restore$/);
+  if (restoreMatch && req.method === 'POST') return sendJson(res, 200, service.restoreBatch(decodeURIComponent(restoreMatch[1]), await readJson(req)));
   const batchMatch = endpoint.match(/^batches\/([^/]+)(?:\/(sync\/orders|orders\/([^/]+)))?$/);
   if (batchMatch) {
     const code = decodeURIComponent(batchMatch[1]);
+    if (!batchMatch[2] && req.method === 'DELETE') return sendJson(res, 200, service.deleteBatch(code, await readJson(req)));
     service.getBatch(code);
     if (!batchMatch[2] && req.method === 'PATCH') {
       const body = await readJson(req);
@@ -252,6 +274,7 @@ async function adminApi(req, res, url) {
     }
     if (batchMatch[2] === 'sync/orders' && req.method === 'POST') {
       await readJson(req);
+      service.getBatch(code);
       if (jobs.active.has('feishu-save')) throw new DomainError(409, 'FEISHU_CONFIG_BUSY', '正在保存飞书配置，请完成后再同步。');
       return sendJson(res, 202, jobs.start(`orders:${code}`, () => sync.syncOrders(code)));
     }
@@ -266,7 +289,7 @@ async function staticFile(req, res, pathname) {
   try { path = resolve(root, `.${decodeURIComponent(pathname)}`); } catch { return sendJson(res, 400, { error: { code: 'BAD_PATH', message: '地址格式不正确。' } }); }
   const rel = relative(root, path);
   if (rel.startsWith('..') || isAbsolute(rel)) return sendJson(res, 403, { error: { code: 'FORBIDDEN', message: '无法访问这个地址。' } });
-  if (/^\/b\/[^/]+(?:\/.*)?$/.test(pathname) || /^\/admin(?:\/.*)?$/.test(pathname)) path = resolve(root, 'index.html');
+  if (pathname === '/' || /^\/b\/[^/]+(?:\/.*)?$/.test(pathname) || /^\/admin(?:\/.*)?$/.test(pathname)) path = resolve(root, 'index.html');
   try {
     const info = await stat(path);
     if (!info.isFile()) throw Object.assign(new Error(), { code: 'ENOENT' });
@@ -293,11 +316,6 @@ const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url || '/', 'http://local.invalid');
     if (url.pathname.startsWith('/api/')) return await api(req, res, url);
-    if (url.pathname === '/') {
-      const defaultBatch = store.getMeta('defaultBatch');
-      res.writeHead(302, { Location: defaultBatch ? `/b/${encodeURIComponent(defaultBatch)}` : '/admin', 'Cache-Control': 'no-store' });
-      return res.end();
-    }
     if (!['GET', 'HEAD'].includes(req.method)) return sendJson(res, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: '不支持该请求方式。' } });
     if (dev) {
       const decoded = decodeURIComponent(url.pathname);

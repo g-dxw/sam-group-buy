@@ -170,7 +170,7 @@ test('unchanged sync counts zero updates; explicit and missing products are kept
   assert.equal(store.getProduct('SAM-002').onSale, false);
 });
 
-test('current product changes preserve legacy dynamic amounts and dirty each affected legacy export row', (t) => {
+test('product changes freeze remaining legacy orders at their previous price and preserve export revisions', (t) => {
   const { service, store, batch } = fixture(t);
   service.submit(batch, payload(service, batch, [2, 1]));
   store.db.prepare('UPDATE order_lines SET snapshot_json=NULL WHERE batch_code=?').run(batch.code);
@@ -181,15 +181,16 @@ test('current product changes preserve legacy dynamic amounts and dirty each aff
   snapshot[0].spec = '新规格';
   store.importProducts(snapshot);
   const query = service.queryOrders(batch, phone);
-  assert.equal(query.products[0].priceCents, 12300);
-  assert.equal(query.products[0].name, '新名称牛奶');
-  assert.equal(query.totalCents, 28500);
+  assert.equal(query.products[0].priceCents, 9900);
+  assert.equal(query.products[0].name, products[0].name);
+  assert.equal(query.totalCents, 23700);
   const dirty = store.listExportLines(batch.code, { onlyDirty: true });
-  assert.equal(dirty.length, 1);
-  assert.equal(dirty[0].revision, 2);
-  assert.equal(dirty[0].syncedRevision, 1);
-  assert.equal(dirty[0].amountCents, 24600);
-  assert.equal(dirty[0].remoteRecordId.startsWith('remote-'), true);
+  assert.equal(dirty.length, 0);
+  const frozen = store.listExportLines(batch.code)[0];
+  assert.equal(frozen.revision, 1);
+  assert.equal(frozen.syncedRevision, 1);
+  assert.equal(frozen.amountCents, 19800);
+  assert.equal(frozen.remoteRecordId.startsWith('remote-'), true);
 });
 
 test('sync acknowledgement of an older version cannot clear a concurrent edit', (t) => {

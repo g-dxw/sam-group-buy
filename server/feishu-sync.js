@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { FeishuRepository } from './feishu-repository.js';
 import { lark, readRecords, normalizeRecords } from './lark.js';
+import { productPricing } from './product-pricing.js';
+import { FeishuCommunityTables, CommunityTableError, communityOrderFields } from './feishu-community-tables.js';
+import { communityExportArchiveKey } from './local-store.js';
 
 const locks = new WeakMap();
 const PRODUCT_ID = /^[\p{L}\p{N}][\p{L}\p{N}_-]{0,127}$/u;
@@ -8,8 +11,13 @@ const STATUSES = ['待采购', '已买到', '缺货', '已领取', '已取消'];
 export const EXPORT_FIELDS = ['明细编号', '提交编号', '团购ID', '小区/群名称', '期次', '手机号', '姓名', '商品ID', '数量', '备注', '处理状态', '提交时间', '同步状态', '预期明细数', '同步商品名称', '同步规格', '同步销售单位', '同步单价', '同步金额', '数据版本'];
 // Optional on legacy tables; fee-bearing orders require the complete snapshot.
 export const ORDER_FEE_SCHEMA = { 同步代购费: 'number', 同步代购费率: 'number', 同步收费类别: 'text', 同步应付金额: 'number' };
+// A single JSON text field retains the frozen pack rule and the final allocation.
+// Ordinary legacy orders can still be backed up without this optional field.
+export const ORDER_SPLIT_SCHEMA = { 同步拼份信息: 'text' };
 export const PRODUCT_SCHEMA = { 商品ID: 'text', 商品名称: 'text', 规格: 'text', 销售单位: 'text', 单价: 'number', 分类: 'text', 在售: 'checkbox', 排序: 'number' };
-export const PRODUCT_BACKUP_SCHEMA = { ...PRODUCT_SCHEMA, 图片地址: 'text', 来源数据: 'text', 数据版本: 'number', 更新时间: 'text' };
+// JSON preserves absent reference prices and fixed-mode ratios as explicit nulls.
+// It also avoids treating an empty numeric cell as a zero-price reference.
+export const PRODUCT_BACKUP_SCHEMA = { ...PRODUCT_SCHEMA, 图片地址: 'text', 来源数据: 'text', 数据版本: 'number', 更新时间: 'text', 定价规则: 'text', 移除时间: 'text' };
 export const PRODUCT_BACKUP_FIELDS = Object.keys(PRODUCT_BACKUP_SCHEMA);
 export const productDestination = source => `${source.baseToken}:${source.productTableId}`;
 export const productBackupArchiveKey = destination => `feishu-product-backup-archive:${destination}`;
@@ -49,6 +57,52 @@ function feeSnapshot(line, amountCents) {
   }
   return fee;
 }
+function splitSnapshot(line, amountCents) {
+  if (line.split == null) return '';
+  const split = line.split;
+  const invalid = () => { throw new SyncError('LOCAL_EXPORT_SPLIT_INVALID', '本地拼份规则或成团分配不完整，未写入飞书。'); };
+  if (!split || typeof split !== 'object' || Array.isArray(split)) invalid();
+  const keys = ['partsPerPack', 'portionSpec', 'packSpec', 'packUnit', 'packPriceCents', 'packProductId', 'packProductName',
+    'requestedQuantity', 'formedQuantity', 'pendingQuantity', 'unformedQuantity', 'settledAt'];
+  const hasPriceSource = Object.hasOwn(split, 'packPriceSource');
+  if (hasPriceSource) keys.push('packPriceSource');
+  if (Object.keys(split).length !== keys.length || keys.some(key => !Object.hasOwn(split, key))
+    || hasPriceSource && !['reference', 'sale_fallback'].includes(split.packPriceSource)) invalid();
+  if (!Number.isSafeInteger(split.partsPerPack) || split.partsPerPack < 2 || split.partsPerPack > 1000
+    || !Number.isSafeInteger(split.packPriceCents) || split.packPriceCents < 0
+    || ['portionSpec', 'packSpec', 'packUnit', 'packProductId', 'packProductName'].some(key => typeof split[key] !== 'string' || !split[key].trim())
+    || !PRODUCT_ID.test(split.packProductId)
+    || ['requestedQuantity', 'formedQuantity', 'pendingQuantity', 'unformedQuantity'].some(key => !Number.isSafeInteger(split[key]) || split[key] < 0)
+    || split.requestedQuantity !== line.quantity
+    || BigInt(split.formedQuantity) + BigInt(split.pendingQuantity) + BigInt(split.unformedQuantity) !== BigInt(split.requestedQuantity)
+    || !(split.settledAt === null || typeof split.settledAt === 'string' && Number.isFinite(timestamp(split.settledAt)))) invalid();
+  const inactive = ['已取消', '缺货'].includes(line.status);
+  const priceCents = line.priceCents ?? line.product?.priceCents;
+  if (!Number.isSafeInteger(priceCents) || priceCents < 0 || !Number.isSafeInteger(amountCents) || amountCents < 0
+    || split.settledAt === null && (split.formedQuantity !== 0 || (inactive ? split.pendingQuantity !== 0 : split.pendingQuantity !== split.requestedQuantity))
+    || split.settledAt !== null && split.pendingQuantity !== 0
+    || (inactive ? amountCents !== 0 : BigInt(amountCents) !== BigInt(priceCents) * BigInt(split.formedQuantity))) invalid();
+  return JSON.stringify(Object.fromEntries([...keys].sort().map(key => [key, split[key]])));
+}
+function pricingSnapshot(product) {
+  try {
+    const { originalPriceCents, pricing, priceCents } = productPricing(product);
+    if (priceCents !== product.priceCents) throw new Error('selling price does not match the pricing rule');
+    return JSON.stringify({ originalPriceCents,
+      pricing: Object.fromEntries(Object.keys(pricing).sort().map(key => [key, pricing[key]])) });
+  } catch {
+    throw new SyncError('LOCAL_PRODUCTS_PRICING_INVALID', '本地商品原价或定价规则不完整，或售价与规则不一致；未写入飞书。');
+  }
+}
+function removalSnapshot(product) {
+  if (product.removedAt == null) return '';
+  if (typeof product.removedAt !== 'string'
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(product.removedAt)
+    || !Number.isFinite(Date.parse(product.removedAt)) || product.onSale !== false) {
+    throw new SyncError('LOCAL_PRODUCTS_REMOVAL_INVALID', '本地商品移除时间或在售状态不一致；未写入飞书。');
+  }
+  return product.removedAt;
+}
 function sameProduct(row, desired) {
   return Boolean(row) && Object.entries(desired).every(([key, value]) => {
     const actual = row.fields[key];
@@ -58,8 +112,10 @@ function sameProduct(row, desired) {
 }
 
 export class FeishuSync {
-  constructor({ store, sourceConfig, repository = new FeishuRepository(), larkCall = lark, readRecordsCall = readRecords, backoffMs = [500, 1500, 3000, 5000], createBatchViews = true }) {
-    Object.assign(this, { store, sourceConfig, repository, larkCall, readRecordsCall, backoffMs, createBatchViews });
+  constructor({ store, sourceConfig, repository = new FeishuRepository(), larkCall = lark, readRecordsCall = readRecords, backoffMs = [500, 1500, 3000, 5000], createBatchViews = true, communityTables = true }) {
+    Object.assign(this, { store, sourceConfig, repository, larkCall, readRecordsCall, backoffMs, createBatchViews, communityTables });
+    this.communityTableService = new FeishuCommunityTables({ store, larkCall, backoffMs,
+      fields: communityId => communityOrderFields(communityId, EXPORT_FIELDS, ORDER_FEE_SCHEMA, ORDER_SPLIT_SCHEMA) });
     if (!locks.has(store)) locks.set(store, new Map());
     this.locks = locks.get(store);
   }
@@ -96,7 +152,7 @@ export class FeishuSync {
         }
       };
       const finish = (status, error = null) => {
-        const currentProducts = this.store.listProducts();
+        const currentProducts = this.store.listProducts({ includeRemoved: true });
         counts.total = currentProducts.length;
         counts.backedUp = currentProducts.filter(product => {
           const record = meta.records?.[product.id];
@@ -113,7 +169,7 @@ export class FeishuSync {
         const destination = productDestination(source);
         if (meta.destination !== destination) meta = { destination, records: {} };
         meta = { ...meta, records: structuredClone(meta.records || {}) };
-        products = structuredClone(this.store.listProducts());
+        products = structuredClone(this.store.listProducts({ includeRemoved: true }));
         const ids = new Set();
         for (const product of products) {
           if (!PRODUCT_ID.test(product.id || '') || ids.has(product.id) || !product.name?.trim() || !product.spec?.trim() || !product.unit?.trim()
@@ -196,7 +252,8 @@ export class FeishuSync {
   productFields(product) {
     return { 商品ID: product.id, 商品名称: product.name, 规格: product.spec, 销售单位: product.unit,
       单价: product.priceCents / 100, 分类: product.category || '', 在售: product.onSale, 排序: product.sort,
-      图片地址: product.imageUrl || '', 来源数据: JSON.stringify(product.source ?? null), 数据版本: product.revision, 更新时间: product.updatedAt };
+      图片地址: product.imageUrl || '', 来源数据: JSON.stringify(product.source ?? null), 数据版本: product.revision, 更新时间: product.updatedAt,
+      定价规则: pricingSnapshot(product), 移除时间: removalSnapshot(product) };
   }
   async ensureProductSchema(source, beforeWrite = () => {}) {
     const read = async () => {
@@ -275,11 +332,89 @@ export class FeishuSync {
   }
   syncOrders(code) { return this.singleFlight(`orders:${code}`, () => this.exportOrders(code)); }
 
-  fields(batch, line, feeFields = []) {
+  switchOrderDestination(code, destination, details) {
+    if (this.store.switchOrderExportDestination) return this.store.switchOrderExportDestination(code, destination, details);
+    // Small legacy protocol fixtures do not implement local destination routing.
+    if (this.communityTables) throw new SyncError('ORDER_DESTINATION_STORE_MISSING', '本地群订单表绑定功能尚未就绪。');
+    const meta = { ...(this.store.getMeta(`feishu-export:${code}`) || {}), destination, ...details };
+    this.store.setMeta(`feishu-export:${code}`, meta); return meta;
+  }
+  async reconcileOldCreates(batch, lines, meta, source, beforeSwitch) {
+    const pending = Object.entries(meta.pendingCreates || {});
+    if (!pending.length) return;
+    if (pending.some(([lineId]) => !lines.some(line => line.lineId === lineId))) {
+      throw new SyncError('ORDER_DESTINATION_PENDING', '旧订单表存在本地无法对应的新增结果，请先核查；未切换群表。');
+    }
+    const schema = await this.verifySchema(source);
+    const fields = [...EXPORT_FIELDS, ...schema.feeFields, ...schema.splitFields];
+    const uncertain = pending.filter(([, attempt]) => attempt.outcome !== 'settled');
+    const checked = await this.poll(source, batch, lines,
+      rows => uncertain.every(([lineId]) => rows.has(lineId)), fields);
+    beforeSwitch();
+    if (!checked.complete) throw new SyncError('ORDER_DESTINATION_PENDING', '旧订单表新增结果尚未确认，已停止创建或切换群表；请稍后同步核查。');
+    for (const [lineId, attempt] of pending) {
+      const row = checked.index.get(lineId);
+      if (row && attempt.ackRecordId && row.record_id !== attempt.ackRecordId) {
+        throw new SyncError('REMOTE_ID_CONFLICT', '旧订单新增返回的记录与读回结果不一致，未切换群表。');
+      }
+    }
+    // Presence and ownership resolve the old create without changing old rows.
+    // The old receipt is archived by the destination switch, including bindings.
+    meta.pendingCreates = {};
+    this.store.setMeta(`feishu-export:${batch.code}`, meta);
+  }
+  targetTableUrl(source) {
+    const url = new URL(source.feishuUrl || `https://www.feishu.cn/base/${source.baseToken}`);
+    url.searchParams.set('table', source.orderTableId); url.searchParams.delete('view');
+    return url.toString();
+  }
+  archivedOrderHints(code, destination, lines) {
+    const archive = this.store.getMeta(communityExportArchiveKey(destination, code));
+    if (!archive) return lines;
+    const candidates = [archive, ...(archive.history || []).slice().reverse()];
+    const hints = new Map();
+    for (const candidate of candidates) {
+      if (candidate.destination?.baseToken !== destination.baseToken || candidate.destination?.orderTableId !== destination.orderTableId) {
+        throw new SyncError('ORDER_EXPORT_ARCHIVE_INVALID', '历史订单表绑定的目标不一致，请核查，未追加订单。');
+      }
+      for (const line of candidate.lines || []) if (line.remoteRecordId && !hints.has(line.lineId)) {
+        hints.set(line.lineId, line.remoteRecordId);
+      }
+    }
+    // Do not restore the archived synchronized revision. The target must read
+    // back its original record before the current version can be acknowledged.
+    return lines.map(line => line.remoteRecordId || !hints.has(line.lineId) ? line
+      : { ...line, remoteRecordId: hints.get(line.lineId) });
+  }
+  pendingOrderHints(meta, lines) {
+    return lines.map(line => {
+      const attempt = meta.pendingCreates?.[line.lineId];
+      const id = attempt?.ackRecordId || attempt?.observedRecordId;
+      if (!id) return line;
+      if (typeof id !== 'string' || line.remoteRecordId && line.remoteRecordId !== id
+        || attempt.ackRecordId && attempt.observedRecordId && attempt.ackRecordId !== attempt.observedRecordId) {
+        throw new SyncError('REMOTE_ID_CONFLICT', '待确认新增记录与本地绑定不一致，已停止追加或覆盖订单。');
+      }
+      return { ...line, remoteRecordId: id };
+    });
+  }
+  rememberVisibleCreates(meta, index) {
+    for (const [lineId, attempt] of Object.entries(meta.pendingCreates || {})) {
+      const row = index.get(lineId); if (!row) continue;
+      if (attempt.ackRecordId && attempt.ackRecordId !== row.record_id
+        || attempt.observedRecordId && attempt.observedRecordId !== row.record_id) {
+        throw new SyncError('REMOTE_ID_CONFLICT', '待确认订单的返回记录与读回结果不一致，请先核查。');
+      }
+      attempt.observedRecordId = row.record_id;
+    }
+  }
+
+  fields(batch, line, feeFields = [], splitFields = []) {
     const product = line.product || {};
     const priceCents = line.priceCents ?? product.priceCents;
     const amountCents = line.amountCents ?? (['已取消', '缺货'].includes(line.status) ? 0 : priceCents * line.quantity);
     const fee = feeSnapshot(line, amountCents);
+    const split = splitSnapshot(line, amountCents);
     const feeValues = { 同步代购费: fee.cents / 100, 同步代购费率: fee.rateBps / 100,
       同步收费类别: FEE_CATEGORY_LABELS[fee.category], 同步应付金额: fee.payableCents / 100 };
     return { '明细编号': line.lineId, '提交编号': line.submissionId, '团购ID': batch.code,
@@ -289,7 +424,8 @@ export class FeishuSync {
       '同步商品名称': line.productName ?? product.name, '同步规格': line.spec ?? product.spec,
       '同步销售单位': line.unit ?? product.unit, '同步单价': priceCents / 100, '同步金额': amountCents / 100,
       '数据版本': line.revision ?? line.version,
-      ...Object.fromEntries(feeFields.map(name => [name, feeValues[name]])) };
+      ...Object.fromEntries(feeFields.map(name => [name, feeValues[name]])),
+      ...Object.fromEntries(splitFields.map(name => [name, split])) };
   }
   validateSnapshot(batch, lines) {
     const ids = new Set();
@@ -311,7 +447,7 @@ export class FeishuSync {
     for (const group of groups.values()) if (group.some(line => line.expectedLines !== group.length)) throw new SyncError('LOCAL_EXPORT_INCOMPLETE', '本地整单明细不完整，未写入飞书。');
     return groups;
   }
-  async verifySchema(source, { requiresFees = false } = {}) {
+  async verifySchema(source, { requiresFees = false, requiresSplit = false } = {}) {
     const result = await this.larkCall(['base', '+table-get', '--base-token', source.baseToken, '--table-id', source.orderTableId]);
     const definitions = result.fields || result.table?.fields || [];
     const names = new Set(definitions.map(field => field.name));
@@ -329,7 +465,21 @@ export class FeishuSync {
     if (requiresFees && missingFeeFields.length) {
       throw new SyncError('EXPORT_FEE_SCHEMA_MISSING', `本地订单已保存；飞书订单表缺少收费字段：${missingFeeFields.map(name => `「${name}」(${ORDER_FEE_SCHEMA[name]})`).join('、')}。请手动补齐后重试备份，本次未写入飞书。`);
     }
-    return { feeFields, missingFeeFields, feeCompatible: !missingFeeFields.length };
+    const splitFields = [];
+    const missingSplitFields = [];
+    for (const [name, type] of Object.entries(ORDER_SPLIT_SCHEMA)) {
+      const matches = definitions.filter(field => field.name === name);
+      if (!matches.length) { missingSplitFields.push(name); continue; }
+      if (matches.length !== 1 || matches[0].type !== type) {
+        throw new SyncError('EXPORT_SPLIT_SCHEMA_INVALID', `订单导出表的「${name}」需为唯一的 ${type} 字段；本地订单已保存，未写入飞书。`);
+      }
+      splitFields.push(name);
+    }
+    if (requiresSplit && missingSplitFields.length) {
+      throw new SyncError('EXPORT_SPLIT_SCHEMA_MISSING', '本地订单已保存；飞书订单表需手动添加唯一的 text 字段「同步拼份信息」，用于完整备份拆分规则和成团分配。本次未写入飞书。');
+    }
+    return { feeFields, missingFeeFields, feeCompatible: !missingFeeFields.length,
+      splitFields, missingSplitFields, splitCompatible: !missingSplitFields.length };
   }
   async remoteRows(source, batch, lines, exportFields = EXPORT_FIELDS) {
     const found = new Map();
@@ -384,17 +534,21 @@ export class FeishuSync {
     }
     return { index: latest, complete: false };
   }
-  async update(source, entries) {
-    for (const group of chunked(entries)) await this.larkCall(['base', '+record-batch-update', '--base-token', source.baseToken,
-      '--table-id', source.orderTableId, '--json', JSON.stringify({ update_records: Object.fromEntries(group) })], { write: true });
+  async update(source, entries, beforeWrite = () => {}) {
+    for (const group of chunked(entries)) {
+      beforeWrite();
+      await this.larkCall(['base', '+record-batch-update', '--base-token', source.baseToken,
+        '--table-id', source.orderTableId, '--json', JSON.stringify({ update_records: Object.fromEntries(group) })], { write: true });
+    }
   }
-  async batchView(source, batch, feeFields = []) {
+  async batchView(source, batch, feeFields = [], beforeWrite = () => {}) {
     if (!this.createBatchViews) return null;
     const viewName = `${batch.communityName} ${batch.periodLabel || `第${batch.periodNumber}期`} · ${batch.code}`.slice(0, 100);
     const listArgs = ['base', '+view-list', '--base-token', source.baseToken, '--table-id', source.orderTableId];
     let result = await this.larkCall(listArgs);
     let view = (result.views || result.items || []).find(item => item.name === viewName);
     if (!view) {
+      beforeWrite();
       await this.larkCall(['base', '+view-create', '--base-token', source.baseToken, '--table-id', source.orderTableId,
         '--json', JSON.stringify({ name: viewName, type: 'grid' })], { write: true });
       result = await this.larkCall(listArgs);
@@ -402,8 +556,10 @@ export class FeishuSync {
     }
     if (!view) return null;
     const id = view.id || view.view_id;
+    beforeWrite();
     await this.larkCall(['base', '+view-set-filter', '--base-token', source.baseToken, '--table-id', source.orderTableId,
       '--view-id', id, '--json', JSON.stringify({ logic: 'and', conditions: [['团购ID', '==', batch.code], ['同步状态', 'intersects', ['已确认']], ['处理状态', 'disjoint', ['已取消', '缺货']], ['数量', '>', 0]] })], { write: true });
+    beforeWrite();
     await this.larkCall(['base', '+view-set-visible-fields', '--base-token', source.baseToken, '--table-id', source.orderTableId,
       '--view-id', id, '--json', JSON.stringify({ visible_fields: ['小区/群名称', '期次', '手机号', '姓名', '同步商品名称', '同步规格', '同步销售单位', '数量', '同步单价', '同步金额', ...feeFields, '处理状态', '备注', '提交时间'] })], { write: true });
     if (!source.feishuUrl) return null;
@@ -412,39 +568,100 @@ export class FeishuSync {
   }
   async exportOrders(code) {
     const key = `feishu-export:${code}`;
-    const meta = this.store.getMeta(key) || {};
+    let meta = this.store.getMeta(key) || {};
     meta.pendingCreates ||= {};
     const counts = { created: 0, updated: 0, unchanged: 0, pending: 0 };
-    const save = () => this.store.setMeta(key, meta);
+    const save = () => {
+      const current = this.store.getMeta(key);
+      if (meta.destination && current?.destination && (meta.destination.baseToken !== current.destination.baseToken
+        || meta.destination.orderTableId !== current.destination.orderTableId)) return;
+      this.store.setMeta(key, meta);
+    };
     let lines = [];
     const finish = (status, error = null) => {
       if (this.store.getBatch(code)) lines = this.store.listExportLines(code, { onlyDirty: false });
-      counts.pending = lines.filter(line => Number(line.revision ?? line.version) > Number(line.syncedRevision ?? line.syncedVersion ?? 0)).length;
-      const result = { status, counts, pending: counts.pending, lastSyncedAt: meta.lastSyncedAt || null, error, viewUrl: meta.viewUrl || null };
+      counts.pending = this.store.getBatch(code) ? this.store.listExportLines(code, { onlyDirty: true }).length
+        : lines.filter(line => Number(line.revision ?? line.version) > Number(line.syncedRevision ?? line.syncedVersion ?? 0)).length;
+      const result = { status, counts, pending: counts.pending, lastSyncedAt: meta.lastSyncedAt || null, error, viewUrl: meta.viewUrl || null,
+        destination: meta.destination || null, scope: meta.scope || 'legacy',
+        targetTableName: meta.targetTableName || meta.tableName || null, targetTableUrl: meta.targetTableUrl || null };
       Object.assign(meta, result); save(); return result;
     };
     try {
-      const source = this.source();
+      const configured = { ...this.source() };
       const batch = this.store.getBatch(code);
       if (!batch) throw new SyncError('BATCH_NOT_FOUND', '本期团购不存在。');
       lines = this.store.listExportLines(code, { onlyDirty: false });
       this.validateSnapshot(batch, lines);
-      const requiresFees = lines.some(line => (line.feeRateBps ?? 0) > 0 || (line.feeCents ?? 0) > 0);
-      const schema = await this.verifySchema(source, { requiresFees });
-      const exportFields = [...EXPORT_FIELDS, ...schema.feeFields];
-      const desired = new Map(lines.map(line => [line.lineId, this.fields(batch, line, schema.feeFields)]));
-      let index = this.indexRemote(batch, lines, await this.remoteRows(source, batch, lines, exportFields));
-      for (const line of lines) if (index.has(line.lineId)) delete meta.pendingCreates[line.lineId];
+      const assertConfigured = () => {
+        const current = this.source(); const fresh = this.store.getBatch(code);
+        if (current.baseToken !== configured.baseToken || !fresh || fresh.communityId !== batch.communityId) {
+          throw new SyncError('ORDER_EXPORT_DESTINATION_CHANGED', '飞书目标或本期群归属已变化，请重新同步；本地订单保留。');
+        }
+        if (!this.communityTables && current.orderTableId !== configured.orderTableId) {
+          throw new SyncError('ORDER_EXPORT_DESTINATION_CHANGED', '飞书订单目标已变化，请重新同步；本地订单保留。');
+        }
+      };
+      if (!meta.destination && (lines.some(line => line.remoteRecordId) || Object.keys(meta.pendingCreates || {}).length)) {
+        meta = this.switchOrderDestination(code, { baseToken: configured.baseToken, orderTableId: configured.orderTableId },
+          { scope: 'legacy', tableName: meta.tableName || '历史下单明细' });
+      }
+      const groupBinding = this.communityTables && this.store.getCommunityOrderTable(configured.baseToken, batch.communityId);
+      const matchesTarget = meta.destination?.baseToken === configured.baseToken
+        && meta.destination.orderTableId === (this.communityTables ? groupBinding?.tableId : configured.orderTableId);
+      if (!matchesTarget && Object.keys(meta.pendingCreates || {}).length) {
+        const previous = meta.destination || { baseToken: configured.baseToken, orderTableId: configured.orderTableId };
+        await this.reconcileOldCreates(batch, lines, meta, { ...configured, ...previous }, assertConfigured);
+      }
+      assertConfigured();
+      const binding = this.communityTables ? await this.communityTableService.ensure(configured, batch, assertConfigured) : null;
+      assertConfigured();
+      const source = { ...configured, orderTableId: binding?.tableId || configured.orderTableId };
+      const destination = { baseToken: source.baseToken, orderTableId: source.orderTableId };
+      meta = this.switchOrderDestination(code, destination,
+        { scope: this.communityTables ? 'community' : 'legacy', tableName: binding?.tableName || meta.tableName || '历史下单明细' });
+      meta.pendingCreates ||= {};
+      meta.targetTableName = meta.tableName; meta.targetTableUrl = this.targetTableUrl(source);
       save();
+      lines = this.pendingOrderHints(meta, this.archivedOrderHints(code, destination, this.store.listExportLines(code, { onlyDirty: false })));
+      this.validateSnapshot(batch, lines);
+      const assertDestination = () => {
+        assertConfigured();
+        const current = this.store.getMeta(key);
+        if (current?.destination?.baseToken !== destination.baseToken || current?.destination?.orderTableId !== destination.orderTableId) {
+          throw new SyncError('ORDER_EXPORT_DESTINATION_CHANGED', '本期订单同步目标已变化，请重新同步。');
+        }
+        if (this.communityTables) {
+          const currentBinding = this.store.getCommunityOrderTable(source.baseToken, batch.communityId);
+          if (currentBinding?.status !== 'ready' || currentBinding.tableId !== source.orderTableId) {
+            throw new SyncError('ORDER_EXPORT_DESTINATION_CHANGED', '本群订单表绑定已变化，请核对后重新同步。');
+          }
+        }
+      };
+      const requiresFees = lines.some(line => (line.feeRateBps ?? 0) > 0 || (line.feeCents ?? 0) > 0);
+      const requiresSplit = lines.some(line => line.split != null);
+      const schema = await this.verifySchema(source, { requiresFees, requiresSplit });
+      assertDestination();
+      const optionalFields = [...schema.feeFields, ...schema.splitFields];
+      const exportFields = [...EXPORT_FIELDS, ...optionalFields];
+      const desired = new Map(lines.map(line => [line.lineId, this.fields(batch, line, schema.feeFields, schema.splitFields)]));
+      let index = this.indexRemote(batch, lines, await this.remoteRows(source, batch, lines, exportFields));
+      assertDestination();
+      this.rememberVisibleCreates(meta, index);
+      save();
+      lines = this.pendingOrderHints(meta, lines);
       const unresolved = lines.filter(line => !index.has(line.lineId) && meta.pendingCreates[line.lineId]?.outcome !== 'settled' && meta.pendingCreates[line.lineId]);
       if (unresolved.length) {
         const checked = await this.poll(source, batch, lines, rows => unresolved.every(line => rows.has(line.lineId)), exportFields);
+        assertDestination();
         index = checked.index;
-        for (const line of unresolved) if (index.has(line.lineId)) delete meta.pendingCreates[line.lineId];
+        this.rememberVisibleCreates(meta, index);
         save();
+        lines = this.pendingOrderHints(meta, lines);
         if (!checked.complete) return finish('pending', { code: 'REMOTE_WRITE_PENDING', message: '上次新增结果尚未确认；再次同步会先对账，避免重复追加。' });
       }
       for (const group of chunked(lines.filter(line => !index.has(line.lineId)))) {
+        assertDestination();
         const attemptId = randomUUID();
         for (const line of group) meta.pendingCreates[line.lineId] = { attemptId, revision: line.revision ?? line.version, outcome: 'unknown', startedAt: new Date().toISOString() };
         save(); // Persist BEFORE the network request: process death cannot permit a blind retry.
@@ -463,12 +680,15 @@ export class FeishuSync {
         }
         group.forEach((line, i) => { meta.pendingCreates[line.lineId].ackRecordId = ids[i]; });
         counts.created += group.length; save();
+        lines = this.pendingOrderHints(meta, lines);
       }
       let checked = await this.poll(source, batch, lines, rows => lines.every(line => rows.has(line.lineId)), exportFields);
+      assertDestination();
       index = checked.index;
       if (!checked.complete) return finish('pending', { code: 'REMOTE_WRITE_PENDING', message: '明细已提交，等待飞书完整可见；本地订单不受影响。' });
-      for (const line of lines) delete meta.pendingCreates[line.lineId];
+      this.rememberVisibleCreates(meta, index);
       save();
+      lines = this.pendingOrderHints(meta, lines);
       const changedSubmissions = new Set(lines.filter(line => !same(index.get(line.lineId), desired.get(line.lineId), true)).map(line => line.submissionId));
       const updates = [];
       for (const line of lines) {
@@ -478,21 +698,35 @@ export class FeishuSync {
         else if (!changedSubmissions.has(line.submissionId)) counts.unchanged += 1;
         if (changedSubmissions.has(line.submissionId) && (!same(row, value) || text(row.fields['同步状态']) !== '待确认')) updates.push([row.record_id, value]);
       }
-      await this.update(source, updates);
+      assertDestination();
+      await this.update(source, updates, assertDestination);
       checked = await this.poll(source, batch, lines, rows => lines.every(line => same(rows.get(line.lineId), desired.get(line.lineId))), exportFields);
+      assertDestination();
       if (!checked.complete) return finish('pending', { code: 'REMOTE_UPDATE_PENDING', message: '订单更新等待飞书确认，请稍后再次同步。' });
       index = checked.index;
+      assertDestination();
       await this.update(source, lines.filter(line => text(index.get(line.lineId).fields['同步状态']) !== '已确认')
-        .map(line => [index.get(line.lineId).record_id, { '同步状态': ['已确认'] }]));
+        .map(line => [index.get(line.lineId).record_id, { '同步状态': ['已确认'] }]), assertDestination);
       checked = await this.poll(source, batch, lines, rows => lines.every(line => same(rows.get(line.lineId), desired.get(line.lineId), true)), exportFields);
+      assertDestination();
       if (!checked.complete) return finish('pending', { code: 'REMOTE_CONFIRM_PENDING', message: '飞书整单确认仍在处理中，请稍后再次同步。' });
-      for (const line of lines) this.store.markExported(code, line.lineId, line.revision ?? line.version, checked.index.get(line.lineId).record_id);
-      meta.lastSyncedAt = new Date().toISOString(); meta.error = null;
-      try { meta.viewUrl = await this.batchView(source, batch, schema.feeFields) || meta.viewUrl || null; } catch { /* View creation is optional; it never invalidates confirmed data. */ }
+      assertDestination();
+      const confirmedMeta = { ...meta, pendingCreates: { ...meta.pendingCreates }, lastSyncedAt: new Date().toISOString(), error: null };
+      const confirmLocal = () => {
+        assertDestination();
+        for (const line of lines) this.store.markExported(code, line.lineId, line.revision ?? line.version, checked.index.get(line.lineId).record_id);
+        for (const line of lines) delete confirmedMeta.pendingCreates[line.lineId];
+        this.store.setMeta(key, confirmedMeta);
+      };
+      if (this.store.transaction) this.store.transaction(confirmLocal);
+      else confirmLocal();
+      meta = confirmedMeta;
+      try { meta.viewUrl = await this.batchView(source, batch, optionalFields, assertDestination) || meta.viewUrl || null; } catch { /* View creation is optional; it never invalidates confirmed data. */ }
+      assertDestination();
       lines = this.store.listExportLines(code, { onlyDirty: false });
       return finish(lines.some(line => Number(line.revision ?? line.version) > Number(line.syncedRevision ?? line.syncedVersion ?? 0)) ? 'pending' : 'success');
     } catch (error) {
-      const message = error instanceof SyncError ? error.message : '同步订单失败，请检查飞书授权或稍后重试；本地订单保留。';
+      const message = error instanceof SyncError || error instanceof CommunityTableError ? error.message : '同步订单失败，请检查飞书授权或稍后重试；本地订单保留。';
       for (const line of lines) this.store.markExportError?.(code, line.lineId, message);
       return finish('error', { code: String(error.code || 'ORDER_SYNC_FAILED'), message });
     }

@@ -59,7 +59,7 @@ function remote({ fees = true, transform = fields => fields } = {}) {
   };
   return api;
 }
-const syncer = (store, api) => new FeishuSync({ store, sourceConfig: source, larkCall: api.larkCall,
+const syncer = (store, api) => new FeishuSync({ store, communityTables: false, sourceConfig: source, larkCall: api.larkCall,
   readRecordsCall: api.readRecordsCall, createBatchViews: false, backoffMs: [] });
 
 test('收费按真实商品明细备份，商品额、费率、分摊费用、类别和应付完整读回；取消费用归零', async t => {

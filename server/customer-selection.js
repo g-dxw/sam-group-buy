@@ -101,7 +101,9 @@ export class CustomerSelection {
     // Local-price selections use the administrator's version, including when
     // their personal ID remains stable after a same-SPU local product appears.
     result.version = quoteVersion(result);
-    if (recommended && !id) return { ...this.service.getCatalog(batch).products.find(p => p.id === local.id),
+    if (this.service.splitRecommendation(batch, result)?.removedAt) return { ...result, onSale: false, selectable: false,
+      selectionUnavailableReason: '本期拼份商品已移除，无法加购；请参与下一期。' };
+    if (recommended && (!id || batch.splitRules?.[local.id])) return { ...this.service.getCatalog(batch).products.find(p => p.id === local.id),
       selfSelected: false, feeCategory: 'recommended', selectable: Boolean(available), spuId: raw.spu_id, priceSource: 'local', available: raw.available, on_sale: raw.on_sale };
     return result;
   }
@@ -158,6 +160,7 @@ export class CustomerSelection {
     const { raw, queriedAt } = await this.detail(body.spuId, batch.samsStore);
     const fresh = this.unchanged(batch, key);
     const product = this.product(raw, fresh, selection.data.keyword, queriedAt);
+    this.service.assertSplitAvailable(this.service.splitRecommendation(fresh, product), product.id);
     if (!product.selectable) throw blocked('商品已停售或库存不足，请选择其他商品。', [product.id]);
     if (product.selfSelected) {
       const previous = this.store.getCustomerProduct(batch.code, ownerHash, product.id);
@@ -175,7 +178,15 @@ export class CustomerSelection {
       const closed = !this.service.safeBatch(batch).collecting;
       let changed = false;
       if (!storeChanged) {
+        if (this.service.splitRecommendation(batch, product)?.removedAt) return this.publicProduct(product,
+          { onSale: false, selectable: false, localChanged: true, selectionUnavailableReason: '本期拼份商品已移除，无法加购；请参与下一期。' });
         const match = this.localMatch(product.spuId, batch);
+        if (match.product && batch.splitRules?.[match.product.id] && batch.productIds.includes(match.product.id)) {
+          const recommended = this.service.getCatalog(batch).products.find(value => value.id === match.product.id);
+          return this.publicProduct({ ...product, name: recommended.name, spec: recommended.spec, unit: recommended.unit,
+            priceCents: recommended.priceCents, split: recommended.split, recommendedProductId: recommended.id,
+            onSale: false, selectable: false }, { storeChanged: false, localChanged: true });
+        }
         changed = Boolean(match.stopped || product.reusedProductId && !match.product);
         if (!changed && match.product && productVersion(match.product) !== product.localVersion) {
           product = { ...product, name: match.product.name, spec: match.product.spec, unit: match.product.unit,
@@ -214,7 +225,7 @@ export class CustomerSelection {
     const currentFees = this.service.getBatch(batch);
     this.service.validateFeePolicy(currentFees, payload, { ownerHash });
     this.service.requireFeeQuote(currentFees, payload, { ownerHash });
-    const offered = new Set(batch.productIds);
+    const offered = new Set(this.service.getCatalog(batch).products.map(product => product.id));
     const personal = payload.items.filter(item => !offered.has(item.productId));
     if (!personal.length) return this.service.submit(batch, input, { ownerHash });
     if (!ownerHash) throw new DomainError(400, 'CUSTOMER_TOKEN_REQUIRED', '个人选品需要原浏览器的清单标识。');
@@ -227,6 +238,10 @@ export class CustomerSelection {
         const item = personal[cursor++];
         const quote = this.store.getCustomerProduct(batch.code, ownerHash, item.productId);
         if (!quote || quote.storeKey !== key) throw blocked('个人商品不属于当前清单或采购门店已调整，请重新搜索。', [item.productId]);
+        const recommendation = this.service.splitRecommendation(current, quote.product);
+        this.service.assertSplitAvailable(recommendation, item.productId);
+        if (recommendation) throw new DomainError(409, 'SPLIT_RECOMMENDATION_REQUIRED', '本期该商品按份拼单，请选择本期推荐中的同款分装商品。',
+          { productIds: [item.productId], recommendedProductId: recommendation.id, catalog: this.service.getCatalog(current) });
         const expired = Date.parse(quote.product.expiresAt) <= this.now();
         const { raw, queriedAt } = await this.detail(quote.product.spuId, current.samsStore);
         const fresh = this.unchanged(batch, key);
@@ -256,7 +271,7 @@ export class CustomerSelection {
     const payload = this.service.normalizeOrder({ ...input, submissionId: '00000000-0000-4000-8000-000000000000',
       phone: input?.phone == null || input.phone === '' ? '13800138000' : input.phone, name: '报价' });
     const batch = this.service.getBatch(batchInput);
-    const offered = new Set(batch.productIds);
+    const offered = new Set(this.service.getCatalog(batch).products.map(product => product.id));
     const personal = payload.items.filter(item => !offered.has(item.productId));
     const ownerHash = customerOwner(token, personal.length > 0);
     const products = new Map();

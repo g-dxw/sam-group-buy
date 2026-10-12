@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { LocalStore } from '../server/local-store.js';
 import { FeishuConfigService } from '../server/feishu-config.js';
-import { FeishuSync, EXPORT_FIELDS, ORDER_FEE_SCHEMA, productDestination, productBackupArchiveKey } from '../server/feishu-sync.js';
+import { FeishuSync, EXPORT_FIELDS, ORDER_FEE_SCHEMA, ORDER_SPLIT_SCHEMA, productDestination, productBackupArchiveKey } from '../server/feishu-sync.js';
 
 const token = 'OldBaseToken1234567890';
 const nextToken = 'NewBaseToken1234567890';
@@ -68,6 +68,41 @@ function fixture(t) {
 }
 const configInput = config => Object.fromEntries(['feishuUrl', 'baseToken', 'productTableId', 'orderTableId'].map(key => [key, config[key]]));
 const fingerprint = config => createHash('sha256').update(JSON.stringify([config.baseToken, config.orderTableId])).digest('hex').slice(0, 24);
+
+test('拼份备份字段可选但必须唯一text，检查与保存投影完整保留兼容提示', async t => {
+  const { api, service } = fixture(t);
+  const missingNames = Object.keys(ORDER_SPLIT_SCHEMA);
+  const ordinary = await service.check(configInput(source));
+  assert.equal(ordinary.status, 'success', 'existing ordinary-order table remains usable');
+  assert.equal(ordinary.checks.orders.splitCompatible, false);
+  assert.deepEqual(ordinary.checks.orders.missingSplitFields, missingNames);
+  assert.match(ordinary.checks.orders.message, /同步拼份信息/);
+  await service.save({ ...configInput(source), revision: 0 });
+  assert.equal(service.get().lastCheck.checks.orders.splitCompatible, false);
+  assert.deepEqual(service.get().lastCheck.checks.orders.missingSplitFields, missingNames);
+  const discovered = await service.inspect({ baseToken: token });
+  assert.equal(discovered.tables[1].orderCompatible, true);
+  assert.equal(discovered.tables[1].splitCompatible, false);
+  assert.deepEqual(discovered.tables[1].missingSplitFields, missingNames);
+
+  api.schemas.get(source.orderTableId).push({ name: missingNames[0], type: 'text' });
+  const compatible = await service.check(configInput(source));
+  assert.equal(compatible.status, 'success');
+  assert.equal(compatible.checks.orders.splitCompatible, true);
+  assert.deepEqual(compatible.checks.orders.missingSplitFields, []);
+  await service.save({ ...configInput(source), revision: 1 });
+  assert.equal(service.get().lastCheck.checks.orders.splitCompatible, true);
+
+  api.schemas.get(source.orderTableId).find(field => field.name === missingNames[0]).type = 'formula';
+  const invalid = await service.check(configInput(source));
+  assert.equal(invalid.status, 'error');
+  assert.match(invalid.checks.orders.missingFields.join(','), /同步拼份信息（需 text 类型）/);
+  api.schemas.get(source.orderTableId).find(field => field.name === missingNames[0]).type = 'text';
+  api.schemas.get(source.orderTableId).push({ name: missingNames[0], type: 'text' });
+  const duplicate = await service.check(configInput(source));
+  assert.equal(duplicate.status, 'error');
+  assert.match(duplicate.checks.orders.missingFields.join(','), /同步拼份信息（字段名称重复）/);
+});
 
 test('拒绝非官方HTTPS链接、任意参数、非法表编号和版本，CLI尚未调用', async t => {
   const { api, service } = fixture(t);
@@ -136,7 +171,7 @@ test('schema缺失、错误类型或只读公式不能通过；失败保存不�
   assert.deepEqual({ config: service.get(), lines: store.listExportLines(batch.code), meta: store.getMeta(`feishu-export:${batch.code}`) }, before);
 });
 
-test('目标切换归档旧meta、清空远端映射并标记全部本地明细待同步，保留数量状态商品配置', async t => {
+test('切换Base固定旧目标归属，保留远端映射直到各期手动同步，数量状态商品不变', async t => {
   const { service, store, batch, lineId } = fixture(t);
   store.updateOrder(batch.code, lineId, { status: '已取消', quantity: 3 });
   const oldMeta = store.getMeta(`feishu-export:${batch.code}`);
@@ -145,18 +180,22 @@ test('目标切换归档旧meta、清空远端映射并标记全部本地明细�
   assert.equal(result.markedPending, 1);
   assert.equal(result.revision, 1);
   const line = store.listExportLines(batch.code)[0];
-  assert.equal(line.remoteRecordId, null);
-  assert.equal(line.syncedRevision, 0);
+  assert.equal(line.remoteRecordId, 'recExisting123');
+  assert.equal(line.syncedRevision, 1);
   assert.equal(line.quantity, 3);
   assert.equal(line.status, '已取消');
   assert.equal(line.revision, 2);
-  assert.equal(store.getMeta(`feishu-export:${batch.code}`), null);
-  assert.deepEqual(store.getMeta(`feishu-export-archive:${fingerprint(source)}:${batch.code}`), oldMeta);
+  assert.deepEqual(store.getMeta(`feishu-export:${batch.code}`), { ...oldMeta,
+    destination: { baseToken: source.baseToken, orderTableId: source.orderTableId },
+    scope: 'legacy', tableName: '历史订单表', feishuUrl: source.feishuUrl });
+  assert.equal(store.getMeta(`feishu-export-archive:${fingerprint(source)}:${batch.code}`), null);
   const saved = store.getMeta('exportSource');
   assert.equal(saved.settingsTableId, source.settingsTableId);
   assert.equal(saved.imageUrlTemplate, source.imageUrlTemplate);
   assert.equal(saved.baseToken, nextToken);
   assert.equal(saved.productTableId, changed.productTableId);
+  assert.equal(saved.orderScope, 'community');
+  assert.equal(result.groupTablesCreatedAutomatically, true);
   assert.equal(store.listProducts().length, 1);
 });
 
@@ -173,7 +212,8 @@ test('current或目标归档存在unknown/settled新增时拒绝切换；同targ
   const same = await service.save({ ...configInput(source), revision: 0 });
   assert.equal(same.changedDestination, false);
   assert.equal(same.markedPending, 0);
-  assert.deepEqual(store.getMeta(key), oldMeta);
+  assert.deepEqual(store.getMeta(key).pendingCreates, oldMeta.pendingCreates);
+  assert.deepEqual(store.getMeta(key).destination, { baseToken: source.baseToken, orderTableId: source.orderTableId });
   assert.equal(store.listExportLines(batch.code)[0].syncedRevision, 1);
   store.setMeta(key, { pendingCreates: {} });
   store.setMeta(`feishu-export-archive:${fingerprint(changed)}:${batch.code}`, { pendingCreates: { [lineId]: { outcome: 'unknown' } } });
@@ -218,13 +258,54 @@ test('仅换商品表、URL或重复保存不重置订单映射；分页空洞�
   const saved = await service.save({ ...configInput(source), feishuUrl: `https://another.feishu.cn/base/${token}`,
     productTableId: changed.productTableId, revision: 0 });
   assert.equal(saved.changedDestination, false);
-  assert.deepEqual(store.getMeta(`feishu-export:${batch.code}`), meta);
+  assert.deepEqual(store.getMeta(`feishu-export:${batch.code}`), { ...meta,
+    destination: { baseToken: source.baseToken, orderTableId: source.orderTableId },
+    scope: 'legacy', tableName: '历史订单表', feishuUrl: source.feishuUrl });
   assert.equal(store.listExportLines(batch.code)[0].remoteRecordId, 'recExisting123');
   assert.equal(store.listExportLines(batch.code)[0].syncedRevision, 1);
   const repeat = await service.save({ ...saved.config, revision: 1 });
   assert.equal(repeat.changedDestination, false);
   api.pages = new Map([['0', { tables: [], has_more: true, total: 20 }]]);
   await assert.rejects(service.inspect({ baseToken: token }), { code: 'FEISHU_CONFIG_RESPONSE_INVALID' });
+});
+
+test('同Base更换历史参考表不会重置任何群表或订单，旧总表的未确认结果保留原目标', async t => {
+  const { service, store, batch, lineId } = fixture(t);
+  const key = `feishu-export:${batch.code}`;
+  const pendingCreates = { [lineId]: { outcome: 'unknown', attemptId: 'old-history-create' } };
+  store.setMeta(key, { pendingCreates });
+  const bindingKey = `feishu-community-table:${token}:${batch.communityId}`;
+  const binding = { status: 'ready', baseToken: token, communityId: batch.communityId,
+    tableId: 'tblExistingGroup', tableName: '配置验收群 · 下单明细' };
+  store.setMeta(bindingKey, binding);
+  const before = store.listExportLines(batch.code);
+  const result = await service.save({ ...configInput(source), orderTableId: changed.orderTableId, revision: 0 });
+  assert.equal(result.changedDestination, false);
+  assert.equal(result.historicalOrderTableChanged, true);
+  assert.equal(result.markedPending, 0);
+  assert.deepEqual(store.getMeta(bindingKey), binding);
+  assert.deepEqual(store.listExportLines(batch.code), before);
+  assert.deepEqual(store.getMeta(key).pendingCreates, pendingCreates);
+  assert.deepEqual(store.getMeta(key).destination, { baseToken: token, orderTableId: source.orderTableId });
+  assert.ok(service.get().groupTablesCreatedAutomatically);
+});
+
+test('切换Base保留群表绑定及已删除期次的旧远端记录和归属，不提前迁移', async t => {
+  const { service, store, batch } = fixture(t);
+  const destination = { baseToken: token, orderTableId: 'tblExistingGroup' };
+  const meta = { destination, scope: 'community', pendingCreates: {}, viewUrl: 'https://example.feishu.cn/group-view' };
+  store.setMeta(`feishu-export:${batch.code}`, meta);
+  const bindingKey = `feishu-community-table:${token}:${batch.communityId}`;
+  const binding = { status: 'ready', ...destination, communityId: batch.communityId, tableId: destination.orderTableId };
+  store.setMeta(bindingKey, binding);
+  store.updateBatch(batch.code, { collecting: false });
+  store.deleteBatch(batch.code);
+  const rows = store.db.prepare('SELECT * FROM order_lines ORDER BY id').all();
+  const result = await service.save({ ...changed, revision: 0 });
+  assert.equal(result.changedDestination, true);
+  assert.deepEqual(store.getMeta(bindingKey), binding);
+  assert.deepEqual(store.getMeta(`feishu-export:${batch.code}`), meta);
+  assert.deepEqual(store.db.prepare('SELECT * FROM order_lines ORDER BY id').all(), rows);
 });
 
 test('旧8字段商品表可检查保存，提示单向写入备份；已有扩展字段错误类型不通过', async t => {
@@ -234,13 +315,60 @@ test('旧8字段商品表可检查保存，提示单向写入备份；已有扩�
   assert.equal(checked.writeMode, 'manual_one_way_backup');
   assert.match(checked.message, /本地商品库为主数据/);
   assert.match(checked.message, /未验证写入权限/);
-  assert.deepEqual(checked.checks.products.fieldsToCreate, ['图片地址', '来源数据', '数据版本', '更新时间']);
+  assert.deepEqual(checked.checks.products.fieldsToCreate, ['图片地址', '来源数据', '数据版本', '更新时间', '定价规则', '移除时间']);
   await service.save({ ...configInput(source), revision: 0 });
   assert.deepEqual(service.get().lastCheck.checks.products.fieldsToCreate, checked.checks.products.fieldsToCreate);
   api.schemas.get(source.productTableId).push({ name: '来源数据', type: 'formula' });
   const wrong = await service.check(configInput(source));
   assert.equal(wrong.status, 'error');
   assert.match(wrong.checks.products.missingFields.join(','), /来源数据（需 text 类型）/);
+});
+
+test('定价规则字段缺失可自动补齐，已有字段必须唯一text，连接检查不进行写入', async t => {
+  const { service, api } = fixture(t);
+  const initial = await service.check(configInput(source));
+  assert.equal(initial.status, 'success');
+  assert.ok(initial.checks.products.fieldsToCreate.includes('定价规则'));
+  assert.match(initial.message, /参考原价与加价设置/);
+  assert.match(initial.message, /固定加价金额或比例/);
+  const discovery = await service.inspect({ baseToken: token });
+  assert.ok(discovery.tables[0].productBackupFieldsToCreate.includes('定价规则'));
+  api.schemas.get(source.productTableId).push({ name: '定价规则', type: 'text' });
+  const complete = await service.check(configInput(source));
+  assert.equal(complete.status, 'success');
+  assert.ok(!complete.checks.products.fieldsToCreate.includes('定价规则'));
+  api.schemas.get(source.productTableId).find(field => field.name === '定价规则').type = 'formula';
+  const wrong = await service.check(configInput(source));
+  assert.equal(wrong.status, 'error');
+  assert.match(wrong.checks.products.missingFields.join(','), /定价规则（需 text 类型）/);
+  api.schemas.get(source.productTableId).find(field => field.name === '定价规则').type = 'text';
+  api.schemas.get(source.productTableId).push({ name: '定价规则', type: 'text' });
+  const duplicate = await service.check(configInput(source));
+  assert.equal(duplicate.status, 'error');
+  assert.match(duplicate.checks.products.missingFields.join(','), /定价规则（字段名称重复）/);
+  assert.ok(api.calls.every(call => call.options?.write !== true));
+});
+
+test('移除时间备份字段缺失可补齐，已有字段必须唯一text且检查不写飞书', async t => {
+  const { service, api } = fixture(t);
+  const initial = await service.check(configInput(source));
+  assert.equal(initial.status, 'success');
+  assert.ok(initial.checks.products.fieldsToCreate.includes('移除时间'));
+  assert.match(initial.message, /已移除商品保留下架备份/);
+  const discovery = await service.inspect({ baseToken: token });
+  assert.ok(discovery.tables[0].productBackupFieldsToCreate.includes('移除时间'));
+  api.schemas.get(source.productTableId).push({ name: '移除时间', type: 'text' });
+  assert.equal((await service.check(configInput(source))).status, 'success');
+  api.schemas.get(source.productTableId).find(field => field.name === '移除时间').type = 'datetime';
+  const wrong = await service.check(configInput(source));
+  assert.equal(wrong.status, 'error');
+  assert.match(wrong.checks.products.missingFields.join(','), /移除时间（需 text 类型）/);
+  api.schemas.get(source.productTableId).find(field => field.name === '移除时间').type = 'text';
+  api.schemas.get(source.productTableId).push({ name: '移除时间', type: 'text' });
+  const duplicate = await service.check(configInput(source));
+  assert.equal(duplicate.status, 'error');
+  assert.match(duplicate.checks.products.missingFields.join(','), /移除时间（字段名称重复）/);
+  assert.ok(api.calls.every(call => call.options?.write !== true));
 });
 
 test('切换商品目标只标记备份待处理，保留本地主数据和订单；切回仍保留未知新增对账标记', async t => {
@@ -270,6 +398,34 @@ test('切换商品目标只标记备份待处理，保留本地主数据和订�
   assert.equal(restored.records.P1.revision, 0);
   assert.equal(restored.records.P1.pendingCreate.attemptId, 'previous-attempt');
   assert.deepEqual(store.listProducts(), products);
+});
+
+test('全部商品移除后切换商品目标仍标记全部待备份，切回保留旧目标绑定且不恢复商品', async t => {
+  const { service, store, batch } = fixture(t);
+  store.removeProducts({ productIds: ['P1'] }, { timestamp: '2026-10-13T03:00:00.000Z' });
+  const products = store.listProducts({ includeRemoved: true });
+  const orders = store.listExportLines(batch.code);
+  const oldBackup = { destination: productDestination(source), status: 'success', records: {
+    P1: { recordId: 'removed-product-record', revision: products[0].revision, lastBackedUpAt: '2026-10-13T03:01:00.000Z' },
+  }, lastSyncedAt: '2026-10-13T03:01:00.000Z' };
+  store.setMeta('feishu-product-backup', oldBackup);
+  const next = { ...configInput(source), productTableId: changed.productTableId };
+  const result = await service.save({ ...next, revision: 0 });
+  assert.equal(result.changedProductDestination, true);
+  assert.equal(result.productsMarkedPending, 1);
+  assert.deepEqual(store.getMeta('feishu-product-backup').counts,
+    { created: 0, updated: 0, unchanged: 0, total: 1, backedUp: 0, pending: 1 });
+  assert.equal(store.getMeta('feishu-product-backup').pending, 1);
+  assert.deepEqual(store.getMeta(productBackupArchiveKey(productDestination(source))), oldBackup);
+  assert.deepEqual(store.listProducts(), []);
+  assert.deepEqual(store.listProducts({ includeRemoved: true }), products);
+  assert.deepEqual(store.listExportLines(batch.code), orders);
+  await service.save({ ...configInput(source), revision: 1 });
+  const restored = store.getMeta('feishu-product-backup');
+  assert.equal(restored.records.P1.recordId, 'removed-product-record');
+  assert.equal(restored.records.P1.revision, 0);
+  assert.equal(restored.counts.pending, 1);
+  assert.deepEqual(store.listProducts({ includeRemoved: true }), products);
 });
 
 test('带has_more的目录完成分页；无类型items和非安全lastCheck不对外返回', async t => {

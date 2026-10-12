@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { LocalStore, samsStoreKey } from '../server/local-store.js';
+import { LocalService } from '../server/local-service.js';
 import { customerOwner } from '../server/customer-selection.js';
 
 const projectRoot = new URL('../', import.meta.url);
@@ -118,15 +119,17 @@ async function fixture(t) {
   return { origin, dir, request, login, remoteCalls };
 }
 
-test('fresh real server boots with no Feishu and redirects the empty installation to admin', async t => {
+test('fresh real server boots with no Feishu and serves the public home with an empty ongoing list', async t => {
   const { request, login, dir, remoteCalls } = await fixture(t);
   const health = await request('/api/health');
   assert.equal(health.json.database.connected, true);
   assert.equal(health.json.feishu.configured, false);
   assert.equal(health.json.feishu.mode, 'manual_one_way_backup');
   const root = await request('/');
-  assert.equal(root.status, 302);
-  assert.equal(root.response.headers.get('location'), '/admin');
+  assert.equal(root.status, 200);
+  assert.equal(root.response.headers.get('location'), null);
+  assert.match(root.response.headers.get('content-type'), /text\/html/);
+  assert.deepEqual((await request('/api/batches', { authenticated: false })).json, { batches: [] });
   await login();
   assert.deepEqual((await request('/api/admin/products')).json.products, []);
   const overview = (await request('/api/admin/overview')).json;
@@ -136,6 +139,44 @@ test('fresh real server boots with no Feishu and redirects the empty installatio
   assert.deepEqual(await remoteCalls(), []);
   const store = new LocalStore({ path: join(dir, 'orders.sqlite') });
   try { assert.equal(store.getMeta('localInitialized'), true); } finally { store.close(); }
+});
+
+test('anonymous ongoing list serves every open period with a strict public card and keeps closed direct links and admin auth intact', async t => {
+  const { request, dir, remoteCalls } = await fixture(t);
+  const store = new LocalStore({ path: join(dir, 'orders.sqlite') });
+  try {
+    store.importProducts([{ id: 'p1', recordId: 'private-remote-id', name: '公开推荐', spec: '一盒', unit: '盒', priceCents: 1000,
+      onSale: true, imageUrl: 'https://images.test/public.jpg', source: { secret: 'private-source' } }]);
+    const service = new LocalService({ store });
+    const create = (communityName, fields = {}) => service.createBatch({ requestId: randomUUID(), communityName,
+      contactNote: 'private-contact', ...fields }).batch;
+    const open = create('公开团购', { description: '公开介绍', pickupLocation: '公开取货点', cutoffAt: new Date(Date.now() + 3_600_000).toISOString() });
+    const sibling = create('另一期团购');
+    const closed = create('已关闭团购', { collecting: false });
+    create('已截止团购', { cutoffAt: new Date(Date.now() - 60_000).toISOString() });
+    const archived = create('已删除团购', { collecting: false }); service.deleteBatch(archived.code);
+    store.setMeta('defaultBatch', closed.code);
+    store.setMeta(`feishu-export:${open.code}`, { pendingCreates: { 'private-write-attempt': { outcome: 'unknown' } }, viewUrl: 'https://private-sync.test' });
+    const result = await request('/api/batches', { authenticated: false }); assert.equal(result.status, 200);
+    assert.deepEqual(result.json.batches.map(batch => batch.code), [sibling.code, open.code]);
+    const card = result.json.batches[1];
+    assert.deepEqual(Object.keys(card).sort(), ['code', 'communityName', 'title', 'periodLabel', 'periodNumber', 'description',
+      'cutoffAt', 'pickupAt', 'pickupLocation', 'productCount', 'coverImages'].sort());
+    assert.equal(card.productCount, 1); assert.deepEqual(card.coverImages, ['https://images.test/public.jpg']);
+    assert.equal(card.description, '公开介绍'); assert.equal(card.pickupLocation, '公开取货点');
+    assert.equal(JSON.stringify(result.json).includes('private-'), false);
+    assert.deepEqual((await request('/api/batches?all=true', { authenticated: false })).json, result.json);
+    assert.equal((await request('/api/batches', { method: 'POST', body: {}, authenticated: false })).status, 405);
+    assert.equal((await request('/api/admin/overview', { authenticated: false })).status, 401);
+    const closedCatalog = await request(`/api/batches/${closed.code}/catalog`, { authenticated: false });
+    assert.equal(closedCatalog.status, 200); assert.equal(closedCatalog.json.batch.collecting, false);
+    assert.equal((await request(`/api/batches/${closed.code}/query`, { method: 'POST', body: { phone: '13800138000' }, authenticated: false })).status, 200);
+    assert.equal((await request(`/api/batches/${archived.code}/catalog`, { authenticated: false })).status, 404);
+    const home = await request('/'); assert.equal(home.status, 200); assert.equal(home.response.headers.get('location'), null);
+    assert.match(home.response.headers.get('content-type'), /text\/html/);
+    assert.equal((await request('/admin')).status, 200); assert.equal((await request(`/b/${closed.code}`)).status, 200);
+    assert.deepEqual(await remoteCalls(), []);
+  } finally { store.close(); }
 });
 
 test('real fee API validates both confirmation versions, quotes without upstream or writes, freezes prices and exposes separate goods and fees', async t => {
@@ -333,7 +374,9 @@ test('authenticated snapshot selection and PATCH preserve duplicates, original s
   assert.equal(products.length, 1);
   assert.equal(products[0].priceCents, 13000);
   const root = await request('/');
-  assert.equal(root.response.headers.get('location'), `/b/${batchCode}`);
+  assert.equal(root.status, 200);
+  assert.equal(root.response.headers.get('location'), null);
+  assert.equal((await request('/api/batches', { authenticated: false })).json.batches[0].code, batchCode);
   assert.equal((await remoteCalls()).length, 3);
 });
 

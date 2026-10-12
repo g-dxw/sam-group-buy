@@ -27,9 +27,11 @@ function TableFeedback({ table, type }) {
   const missing = type === 'products' ? table.missingProductFields : table.missingOrderFields;
   const compatible = type === 'products' ? table.productCompatible : table.orderCompatible;
   return <div className={`feishu-table-feedback ${compatible ? '' : 'needs-fields'}`}>
-    <span>{compatible ? '所需字段齐全' : '所需字段尚未齐全'}</span>
+    <span>{type === 'orders' ? '历史表' : ''}{compatible ? '所需字段齐全' : '所需字段尚未齐全'}</span>
     {missing?.length > 0 && <p>缺少或不匹配的字段：{missing.map(fieldName).join('、')}</p>}
-    {type === 'orders' && table.feeCompatible === false && <p>当前表仅支持零代购费订单。收费订单需补齐：{table.missingFeeFields?.map(fieldName).join('、')}。</p>}
+    {type === 'products' && table.productBackupFieldsToCreate?.length > 0 && <p>手动备份时会补齐：{table.productBackupFieldsToCreate.map(fieldName).join('、')}。</p>}
+    {type === 'orders' && table.feeCompatible === false && <p>恢复旧收费订单备份时需补齐：{table.missingFeeFields?.map(fieldName).join('、')}。新群订单表会自动建立所需字段。</p>}
+    {type === 'orders' && table.splitCompatible === false && <p>恢复旧拼单订单备份时需补齐：{table.missingSplitFields?.map(fieldName).join('、')}（文本字段）。新群订单表会自动建立所需字段。</p>}
   </div>;
 }
 
@@ -37,7 +39,7 @@ function CheckResult({ result, stale }) {
   if (!result) return null;
   if (stale) return <div className="feishu-check-stale" role="status">配置已修改，请重新检查连接。</div>;
   const success = result.status === 'success';
-  const rows = [['base', '多维表格访问'], ['products', '商品备份表字段'], ['orders', '订单表字段']];
+  const rows = [['base', '多维表格访问'], ['products', '商品备份表字段'], ['orders', '历史订单表字段']];
   return <section className={`feishu-check-result ${success ? '' : 'has-error'}`} aria-label="连接检查结果">
     <div className="feishu-result-heading"><ConfigIcon name={success ? 'check' : 'shield'} /><div><strong>{success ? '连接和字段检查通过' : '连接检查未通过'}</strong>{result.checkedAt && <small>{checkedTime(result.checkedAt)}</small>}</div></div>
     {result.message && <p>{result.message}</p>}
@@ -45,9 +47,9 @@ function CheckResult({ result, stale }) {
       const check = result.checks[key];
       const passed = checkPassed(check);
       const missing = check?.missingFields || check?.missing || [];
-      return <div className="feishu-check-row" key={key}><span>{label}</span><span className={`admin-pill ${passed ? '' : 'neutral'}`}>{passed ? '通过' : '待核对'}</span>{check?.message && <p>{check.message}</p>}{Array.isArray(missing) && missing.length > 0 && <p>缺少或不匹配的字段：{missing.map(fieldName).join('、')}</p>}{key === 'orders' && check.feeCompatible === false && <p>收费订单需补齐字段：{check.missingFeeFields?.map(fieldName).join('、')}。本地订单会保留，字段齐全后可重新备份。</p>}</div>;
+      return <div className="feishu-check-row" key={key}><span>{label}</span><span className={`admin-pill ${passed ? '' : 'neutral'}`}>{passed ? '通过' : '待核对'}</span>{check?.message && <p>{check.message}</p>}{Array.isArray(missing) && missing.length > 0 && <p>缺少或不匹配的字段：{missing.map(fieldName).join('、')}</p>}{key === 'orders' && check.feeCompatible === false && <p>恢复旧收费订单备份需补齐：{check.missingFeeFields?.map(fieldName).join('、')}。本地订单会保留。</p>}{key === 'orders' && check.splitCompatible === false && <p>恢复旧拼单订单备份需补齐：{check.missingSplitFields?.map(fieldName).join('、')}（文本字段）。本地订单会保留。</p>}</div>;
     })}</div>
-    <p className="feishu-check-help">此检查核对表格访问和字段；商品与订单写入权限以实际备份、同步结果为准。</p>
+    <p className="feishu-check-help">此检查核对多维表格访问、商品表和历史订单表字段；群订单表的创建、写入权限以首次手动同步结果为准。</p>
   </section>;
 }
 
@@ -148,7 +150,7 @@ export default function FeishuConfig({ api, onSaved, notify }) {
             productTableId: discovered.some(table => table.id === previous.productTableId) ? previous.productTableId : '',
             orderTableId: discovered.some(table => table.id === previous.orderTableId) ? previous.orderTableId : '' }));
           setCheck(null); setSavedResult(null);
-          notify(`已读取 ${discovered.length} 张数据表，请选择商品备份表和订单表`);
+          notify(`已读取 ${discovered.length} 张数据表，请选择商品备份表和历史订单表`);
         } else if (target.kind === 'check') {
           setCheck({ signature: target.signature, result });
           notify(result.status === 'success' ? '连接和字段检查通过' : result.message || '请核对检查结果', result.status !== 'success');
@@ -195,7 +197,7 @@ export default function FeishuConfig({ api, onSaved, notify }) {
     const config = readForm();
     setError(''); setSavedResult(null);
     if (!config.feishuUrl && !config.baseToken) { setError('请粘贴飞书多维表格链接，或在高级配置中填写 Base ID。'); return; }
-    if (kind !== 'inspect' && (!config.productTableId || !config.orderTableId)) { setError('请先选择商品表和订单表。'); return; }
+    if (kind !== 'inspect' && (!config.productTableId || !config.orderTableId)) { setError('请先选择商品备份表和历史订单表。'); return; }
     setStarting(kind);
     try {
       const response = await boundedRequest(kind === 'inspect' ? '/feishu/inspect' : kind === 'check' ? '/feishu/check' : '/feishu/config', {
@@ -214,7 +216,7 @@ export default function FeishuConfig({ api, onSaved, notify }) {
 
   function tableOptions(type, selectedId) {
     const options = [...tables];
-    if (selectedId && !options.some(table => table.id === selectedId)) options.unshift({ id: selectedId, name: selectedId === saved[`${type}TableId`] ? `已保存的数据表 · ${selectedId}` : `指定数据表 · ${selectedId}` });
+    if (selectedId && !options.some(table => table.id === selectedId)) options.unshift({ id: selectedId, name: `${selectedId === saved[`${type}TableId`] ? '已保存的' : '指定的'}${type === 'order' ? '历史订单表' : '商品备份表'}` });
     return options;
   }
 
@@ -222,28 +224,29 @@ export default function FeishuConfig({ api, onSaved, notify }) {
   if (loadFailed) return <section className="admin-card feishu-load-error"><h2>暂时无法读取飞书配置</h2><p role="alert">{error}</p><button className="admin-btn" type="button" onClick={loadConfig}><ConfigIcon name="refresh" size={17} />重新读取配置</button></section>;
 
   return <div className="feishu-config-page">
-    <section className="feishu-flow-banner"><div><span>本地维护</span><strong>商品库与订单</strong></div><span className="feishu-flow-action">手动备份 / 同步<ConfigIcon name="arrow" size={18} /></span><div><span>飞书保存</span><strong>商品表 · 订单表</strong></div></section>
+    <section className="feishu-flow-banner"><div><span>本地维护</span><strong>商品库与订单</strong></div><span className="feishu-flow-action">手动备份 / 同步<ConfigIcon name="arrow" size={18} /></span><div><span>飞书保存</span><strong>共享商品表 · 各群订单表</strong></div></section>
     <div className="feishu-config-layout"><section className="admin-card feishu-config-card">
-      <div className="admin-card-heading"><div><h2>连接飞书多维表格</h2><p>选择商品备份与订单同步目标。</p></div><span className={`admin-pill ${dirty || !hasDestination ? 'neutral' : ''}`}>{active && job?.kind === 'save' || starting === 'save' ? '正在保存' : dirty ? '有未保存的修改' : hasDestination ? '配置已保存' : '尚未配置'}</span></div>
+      <div className="admin-card-heading"><div><h2>连接飞书多维表格</h2><p>商品共用备份，订单按群分别保存。</p></div><span className={`admin-pill ${dirty || !hasDestination ? 'neutral' : ''}`}>{active && job?.kind === 'save' || starting === 'save' ? '正在保存' : dirty ? '有未保存的修改' : hasDestination ? '配置已保存' : '尚未配置'}</span></div>
       <form ref={formRef} onSubmit={event => { event.preventDefault(); start('save'); }}>
+        <div className="feishu-order-scope"><ConfigIcon name="table" size={21} /><div><strong>每个群独立订单表</strong><p>同群各期分开查看，首次手动同步自动建表，无需选择群表。商品继续共用下方的备份表。</p></div></div>
         <fieldset disabled={active}>
           <label className="admin-field">多维表格链接<input type="url" name="feishuUrl" value={draft.feishuUrl} onChange={event => updateField('feishuUrl', event.currentTarget.value)} onInput={event => updateField('feishuUrl', event.currentTarget.value)} placeholder="粘贴飞书多维表格的完整链接" autoComplete="off" maxLength={2000} /></label>
-          <p className="admin-help">修改链接后，重新读取数据表，再选择商品表与订单表。</p>
+          <p className="admin-help">修改链接后，重新读取数据表，再选择商品备份表与历史订单表。</p>
           <button className="admin-btn feishu-inspect-btn" type="button" onClick={() => start('inspect')} disabled={active || !(draft.feishuUrl || draft.baseToken)}><ConfigIcon name="table" size={17} />{starting === 'inspect' || job?.kind === 'inspect' && job.status === 'running' ? '正在读取数据表…' : '读取数据表'}</button>
           {discoveredBase && <div className="feishu-discovered-base"><ConfigIcon name="table" size={17} /><span>{discoveredBase.name || '已读取多维表格'}<small>{tables.length} 张数据表</small></span></div>}
           <div className="admin-form-grid feishu-table-fields">
-            <div><label className="admin-field">商品备份表<select name={advanced ? undefined : 'productTableId'} value={draft.productTableId} onChange={event => updateField('productTableId', event.currentTarget.value)} aria-describedby="product-table-help"><option value="">请选择商品备份表</option>{tableOptions('product', draft.productTableId).map(table => <option key={table.id} value={table.id}>{table.name}{table.productCompatible === false ? ' · 缺少所需字段' : ''}</option>)}</select></label><p className="admin-help" id="product-table-help">接收本地商品名称、规格、售价和来源信息的备份。</p><TableFeedback table={tables.find(table => table.id === draft.productTableId)} type="products" /></div>
-            <div><label className="admin-field">订单表<select name={advanced ? undefined : 'orderTableId'} value={draft.orderTableId} onChange={event => updateField('orderTableId', event.currentTarget.value)} aria-describedby="order-table-help"><option value="">请选择订单表</option>{tableOptions('order', draft.orderTableId).map(table => <option key={table.id} value={table.id}>{table.name}{table.orderCompatible === false ? ' · 缺少所需字段' : ''}</option>)}</select></label><p className="admin-help" id="order-table-help">接收后台手动同步的本地订单。</p><TableFeedback table={tables.find(table => table.id === draft.orderTableId)} type="orders" /></div>
+            <div><label className="admin-field">商品备份表<select name={advanced ? undefined : 'productTableId'} value={draft.productTableId} onChange={event => updateField('productTableId', event.currentTarget.value)} aria-describedby="product-table-help"><option value="">请选择商品备份表</option>{tableOptions('product', draft.productTableId).map(table => <option key={table.id} value={table.id}>{table.name}{table.productCompatible === false ? ' · 缺少所需字段' : ''}</option>)}</select></label><p className="admin-help" id="product-table-help">备份商品资料；「单价」保存售价，「定价规则」保存参考原价及固定金额或比例加价设置，也保留旧固定售价。备份数量包含已移除商品；「移除时间」保存移除状态，恢复后清空，飞书记录保留。</p><TableFeedback table={tables.find(table => table.id === draft.productTableId)} type="products" /></div>
+            <div><label className="admin-field">历史订单表<select name={advanced ? undefined : 'orderTableId'} value={draft.orderTableId} onChange={event => updateField('orderTableId', event.currentTarget.value)} aria-describedby="order-table-help"><option value="">请选择历史订单表</option>{tableOptions('order', draft.orderTableId).map(table => <option key={table.id} value={table.id}>{table.name}{table.orderCompatible === false ? ' · 缺少所需字段' : ''}</option>)}</select></label><p className="admin-help" id="order-table-help">用于保留、核查旧备份，以及恢复未完成的旧同步。新订单会同步到各群自动建立的独立订单表。</p><TableFeedback table={tables.find(table => table.id === draft.orderTableId)} type="orders" /></div>
           </div>
-          <details className="feishu-advanced" open={advanced} onToggle={event => setAdvanced(event.currentTarget.open)}><summary>高级配置：直接填写数据表 ID</summary>{advanced ? <div><label className="admin-field">Base ID<input name="baseToken" value={draft.baseToken} onChange={event => updateField('baseToken', event.currentTarget.value)} onInput={event => updateField('baseToken', event.currentTarget.value)} placeholder="多维表格 Base ID" autoComplete="off" maxLength={200} /></label><div className="admin-form-grid"><label className="admin-field">商品备份表 ID<input name="productTableId" value={draft.productTableId} onChange={event => updateField('productTableId', event.currentTarget.value)} onInput={event => updateField('productTableId', event.currentTarget.value)} placeholder="tbl…" autoComplete="off" maxLength={200} /></label><label className="admin-field">订单表 ID<input name="orderTableId" value={draft.orderTableId} onChange={event => updateField('orderTableId', event.currentTarget.value)} onInput={event => updateField('orderTableId', event.currentTarget.value)} placeholder="tbl…" autoComplete="off" maxLength={200} /></label></div></div> : <input type="hidden" name="baseToken" value={draft.baseToken} />}</details>
+          <details className="feishu-advanced" open={advanced} onToggle={event => setAdvanced(event.currentTarget.open)}><summary>高级配置：直接填写数据表 ID</summary>{advanced ? <div><label className="admin-field">Base ID<input name="baseToken" value={draft.baseToken} onChange={event => updateField('baseToken', event.currentTarget.value)} onInput={event => updateField('baseToken', event.currentTarget.value)} placeholder="多维表格 Base ID" autoComplete="off" maxLength={200} /></label><div className="admin-form-grid"><label className="admin-field">商品备份表 ID<input name="productTableId" value={draft.productTableId} onChange={event => updateField('productTableId', event.currentTarget.value)} onInput={event => updateField('productTableId', event.currentTarget.value)} placeholder="tbl…" autoComplete="off" maxLength={200} /></label><label className="admin-field">历史订单表 ID<input name="orderTableId" value={draft.orderTableId} onChange={event => updateField('orderTableId', event.currentTarget.value)} onInput={event => updateField('orderTableId', event.currentTarget.value)} placeholder="tbl…" autoComplete="off" maxLength={200} /></label></div></div> : <input type="hidden" name="baseToken" value={draft.baseToken} />}</details>
         </fieldset>
         {error && <div className="admin-alert error feishu-config-error" role="alert">{error}</div>}
         {job?.status === 'running' && <div className="admin-alert feishu-job-notice" role="status"><span className="admin-spinner" /><span>{job.kind === 'inspect' ? '正在读取多维表格和数据表' : job.kind === 'check' ? '正在检查连接与字段' : '正在保存配置'}…{job.message && ` ${job.message}`}</span></div>}
         {job?.status === 'paused' && <div className="admin-alert warning feishu-job-notice" role="status"><span>{job.message}</span><button type="button" className="admin-link" onClick={() => { setJob(previous => ({ ...previous, status: 'running', message: '' })); setPollVersion(value => value + 1); }}>继续确认结果</button></div>}
         <CheckResult result={check?.result} stale={!currentCheck} />
-        {savedResult && <div className="feishu-saved-result" role="status"><ConfigIcon name="check" size={19} /><div><strong>飞书配置已保存</strong><p>保存配置不会自动备份商品或同步订单。</p>{savedResult.changedDestination && <p>订单目标已切换，{Number.isInteger(savedResult.markedPending) ? `${savedResult.markedPending} 条` : '已有'}订单明细已标记待同步；原订单表保持不变。</p>}</div></div>}
+        {savedResult && <div className="feishu-saved-result" role="status"><ConfigIcon name="check" size={19} /><div><strong>飞书配置已保存</strong><p>保存配置不会自动备份商品或同步订单。</p>{savedResult.changedDestination && <p>已切换多维表格，{Number.isInteger(savedResult.markedPending) ? `${savedResult.markedPending} 条` : '已有'}订单明细待同步；各群首次手动同步时会在新多维表格建表。原表和备份保留。</p>}{!savedResult.changedDestination && savedResult.historicalOrderTableChanged && <p>历史订单表已更新，各群订单表和同步状态继续保留。</p>}</div></div>}
         <div className="admin-form-footer feishu-config-actions"><button type="button" className="admin-btn" onClick={() => start('check')} disabled={active || !complete}><ConfigIcon name="shield" size={17} />{starting === 'check' || job?.kind === 'check' && job.status === 'running' ? '正在检查…' : '检查连接'}</button><button type="submit" className="admin-btn primary" disabled={active || !complete || !dirty}><ConfigIcon name="save" size={17} />{starting === 'save' || job?.kind === 'save' && job.status === 'running' ? '正在保存…' : '保存配置'}</button><button type="button" className="admin-link feishu-reload" onClick={loadConfig} disabled={active}>重新读取已保存配置</button></div>
       </form>
-    </section><aside className="feishu-config-notes"><section className="admin-card"><div className="feishu-note-icon"><ConfigIcon name="shield" size={23} /></div><h3>沿用服务器的飞书授权</h3><p>使用当前服务器已授权的 lark-cli 用户身份访问表格。</p><p>无需在这里填写 App Secret 或访问令牌。当前身份需有商品表与订单表的编辑权限。</p></section><section className="admin-card"><h3>配置后，按需手动同步</h3><ol><li>在“山姆选品”搜索并加入商品库，核对售价后上架。</li><li>在“商品库”点击“同步到飞书备份”，保存商品资料。</li><li>邻居下单后，在“订单统计”手动同步本期订单到飞书。</li></ol><p>切换订单同步目标，会把已有明细标记待同步；原表中的数据不会修改。</p></section></aside></div>
+    </section><aside className="feishu-config-notes"><section className="admin-card"><div className="feishu-note-icon"><ConfigIcon name="shield" size={23} /></div><h3>沿用服务器的飞书授权</h3><p>使用当前服务器已授权的 lark-cli 用户身份访问表格。</p><p>无需在这里填写 App Secret 或访问令牌。当前身份需能编辑商品备份表，并在该多维表格中创建、编辑群订单表。</p></section><section className="admin-card"><h3>配置后，按需手动同步</h3><ol><li>在“山姆选品”搜索并加入商品库，核对售价后上架。</li><li>在“商品库”点击“同步到飞书备份”，保存商品资料。</li><li>邻居下单后，在“订单统计”手动同步本期订单，首次同步会自动建立本群订单表。</li></ol><p>切换到其他多维表格后，各群首次手动同步才会建立新表，原表和备份保留。在同一多维表格中调整历史订单表，各群订单继续沿用现有表。</p></section></aside></div>
   </div>;
 }
