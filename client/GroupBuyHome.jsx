@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import './group-buy-home.css';
+import { ServiceNotice } from './ServiceNotice.jsx';
 
 function HomeIcon({ name, size = 20 }) {
   const paths = {
@@ -87,7 +88,7 @@ export default function GroupBuyHome() {
 
   useEffect(() => {
     live.current = true;
-    document.title = '一起逛山姆 · 进行中的团购';
+    document.title = '邻里代购 · 进行中的团购';
     loadBatches();
     const onVisible = () => { if (document.visibilityState === 'visible') loadBatches(); };
     const onPageShow = event => { if (event.persisted) loadBatches(); };
@@ -113,6 +114,7 @@ export default function GroupBuyHome() {
     <header className="site-header"><div className="header-inner"><div className="brand"><span className="brand-mark"><HomeIcon name="bag" size={22} /></span><span>一起逛山姆<small>选择团购 · 一起选购</small></span></div><span className="group-buy-header-note"><HomeIcon name="leaf" size={17} />和邻居一起选好物</span></div></header>
     <main className="group-buy-home-shell">
       <section className="group-buy-home-intro"><span className="group-buy-home-eyebrow"><HomeIcon name="leaf" size={17} />好物一起买</span><h1>进行中的团购</h1><p>选择你所在的群和期次，进入后查看商品并下单。</p>{state === 'ready' && ongoing.length > 0 && <span className="group-buy-home-count" aria-live="polite">{ongoing.length} 期正在收集</span>}</section>
+      <ServiceNotice />
       {state === 'loading' && <div className="group-buy-home-state" role="status"><span className="spinner" />正在查看进行中的团购…</div>}
       {state === 'error' && <section className="group-buy-home-empty" aria-label="团购列表加载失败"><span className="group-buy-state-icon"><HomeIcon name="info" size={30} /></span><h2>暂时无法加载团购</h2><p role="alert">{error}</p><button type="button" className="button primary" onClick={loadBatches}><HomeIcon name="refresh" size={17} />重新加载</button></section>}
       {state === 'ready' && (ongoing.length ? <section className="group-buy-home-grid" aria-label="进行中的团购列表">{ongoing.map(batch => <GroupBuyCard key={batch.code} batch={batch} />)}</section> : <section className="group-buy-home-empty"><span className="group-buy-state-icon"><HomeIcon name="bag" size={31} /></span><h2>暂时没有进行中的团购</h2><p>新一期开放后会出现在这里，也可以向团长了解下一期安排。</p><button type="button" className="button secondary" onClick={loadBatches}><HomeIcon name="refresh" size={17} />重新查看</button></section>)}
