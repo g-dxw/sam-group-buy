@@ -1,0 +1,87 @@
+name: Deploy production
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Never expose deployment credentials to a PR or to a dispatch from another branch.
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || vars.DEPLOY_ENABLED == 'true')
+    environment: production
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout the selected main commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npm run package:release
+      - name: Upload validated deployment bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-${{ github.sha }}
+          path: |
+            .artifacts/sam-group-buy-*.tar.gz
+            .artifacts/sam-group-buy-*.manifest.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Deploy over SSH with verified host keys
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_ROOT: ${{ vars.DEPLOY_PATH || '/srv/apps/sam-group-buy' }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ -n "$DEPLOY_SSH_KEY" && -n "$DEPLOY_KNOWN_HOSTS" ]] || { echo 'Configure SSH key and known hosts in the production environment.' >&2; exit 1; }
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ || "$DEPLOY_HOST" =~ ^[0-9A-Fa-f:]+$ ]] || { echo 'Invalid deployment host.' >&2; exit 1; }
+          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo 'Invalid deployment user.' >&2; exit 1; }
+          port="${DEPLOY_PORT:-22}"
+          [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || { echo 'Invalid deployment port.' >&2; exit 1; }
+          deploy_root="${DEPLOY_ROOT%/}"
+          [[ "$deploy_root" =~ ^/[A-Za-z0-9_./-]+$ && "$deploy_root" != *'/../'* && "$deploy_root" != */.. && "$deploy_root" != *'/./'* && "$deploy_root" != */. ]] || { echo 'Invalid deployment path.' >&2; exit 1; }
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40,64}$ ]] || { echo 'Invalid release commit.' >&2; exit 1; }
+          ssh_directory="$(mktemp -d "$RUNNER_TEMP/sam-deploy.XXXXXX")"
+          trap 'rm -rf "$ssh_directory"' EXIT
+          key_file="$ssh_directory/identity"
+          hosts_file="$ssh_directory/known_hosts"
+          printf '%s\n' "$DEPLOY_SSH_KEY" | tr -d '\r' > "$key_file"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$hosts_file"
+          chmod 600 "$key_file" "$hosts_file"
+          ssh-keygen -y -f "$key_file" </dev/null >/dev/null
+          host_lookup="$DEPLOY_HOST"
+          [[ "$port" == 22 ]] || host_lookup="[$DEPLOY_HOST]:$port"
+          ssh-keygen -F "$host_lookup" -f "$hosts_file" >/dev/null || { echo 'The supplied known hosts do not include this deployment host and port.' >&2; exit 1; }
+          common_ssh=(-i "$key_file" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$hosts_file" -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=15)
+          destination="$DEPLOY_USER@$DEPLOY_HOST"
+          scp_host="$DEPLOY_HOST"
+          [[ "$DEPLOY_HOST" != *:* ]] || scp_host="[$DEPLOY_HOST]"
+          incoming="$deploy_root/incoming/$RELEASE_SHA"
+          stem="sam-group-buy-$RELEASE_SHA"
+          ssh "${common_ssh[@]}" -p "$port" -- "$destination" "mkdir -p '$incoming' && chmod 700 '$incoming'"
+          scp "${common_ssh[@]}" -P "$port" -- ".artifacts/$stem.tar.gz" ".artifacts/$stem.manifest.json" ops/deploy-release.sh "$DEPLOY_USER@$scp_host:$incoming/"
+          ssh "${common_ssh[@]}" -p "$port" -- "$destination" "DEPLOY_ROOT='$deploy_root' bash '$incoming/deploy-release.sh' '$incoming/$stem.tar.gz' '$incoming/$stem.manifest.json' '$RELEASE_SHA'"

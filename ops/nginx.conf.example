@@ -1,0 +1,29 @@
+# Replace sam.example.com with your hostname. Obtain its certificate before
+# enabling the HTTPS block. Keep the Node port bound to 127.0.0.1.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name sam.example.com;
+    location /.well-known/acme-challenge/ { root /var/www/letsencrypt; }
+    location / { return 301 https://$host$request_uri; }
+}
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name sam.example.com;
+    ssl_certificate /etc/letsencrypt/live/sam.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/sam.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    client_max_body_size 128k;
+    gzip on;
+    gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+    location / {
+        proxy_pass http://127.0.0.1:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 65s;
+    }
+}

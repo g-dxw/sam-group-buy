@@ -1,0 +1,30 @@
+{
+  "name": "sam-group-buy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env server/index.js --dev",
+    "build": "vite build",
+    "start": "node --env-file-if-exists=.env server/index.js",
+    "test": "node --test test/*.test.js",
+    "setup:feishu": "node --env-file-if-exists=.env scripts/setup-feishu.mjs",
+    "setup:admin": "node --env-file-if-exists=.env scripts/setup-admin.mjs",
+    "backup": "node --env-file-if-exists=.env scripts/backup-local.mjs",
+    "connect:batch": "node --env-file-if-exists=.env scripts/connect-batch.mjs",
+    "resolve:submission": "node --env-file-if-exists=.env scripts/resolve-submission.mjs",
+    "package:release": "node scripts/package-release.mjs"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "6.1.2",
+    "vite": "8.3.4"
+  }
+}

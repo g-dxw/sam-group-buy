@@ -1,0 +1,27 @@
+[Unit]
+Description=Sam group buy collection
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sam-group-buy
+Group=sam-group-buy
+WorkingDirectory=/srv/apps/sam-group-buy/current
+Environment=NODE_ENV=production
+Environment=HOME=/srv/apps/sam-group-buy/shared/home
+Environment=PATH=/srv/apps/sam-group-buy/runtime/node/bin:/srv/apps/sam-group-buy/runtime/bin:/usr/bin:/bin
+ExecStart=/srv/apps/sam-group-buy/runtime/node/bin/node --env-file=/srv/apps/sam-group-buy/shared/.env /srv/apps/sam-group-buy/current/server/index.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=65
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/apps/sam-group-buy/shared
+
+[Install]
+WantedBy=multi-user.target
