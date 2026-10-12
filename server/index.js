@@ -15,6 +15,8 @@ import { AdminAuth } from './admin-auth.js';
 import { SyncJobs } from './sync-jobs.js';
 import { initializeLocalData } from './bootstrap-local.js';
 import { acquireRuntimeLock } from './runtime-lock.js';
+import { SamsCatalog } from './sams-catalog.js';
+import { CustomerSelection } from './customer-selection.js';
 
 const projectRoot = fileURLToPath(new URL('../', import.meta.url));
 const dataDir = resolve(process.env.DATA_DIR || resolve(projectRoot, '.data'));
@@ -26,15 +28,12 @@ const repository = new FeishuRepository();
 const service = new LocalService({ store });
 const auth = await new AdminAuth({ dataDir, password: process.env.ADMIN_PASSWORD }).initialize();
 const jobs = new SyncJobs();
+const sams = new SamsCatalog({ hasProduct: id => Boolean(store.getProduct(id)) });
+const customerSelection = new CustomerSelection({ store, service, sams });
 const dev = process.argv.includes('--dev');
 const host = process.env.HOST || '127.0.0.1';
 const port = Number(process.env.PORT || 3001);
 const config = await loadConfig();
-if (!config.batches?.length) {
-  console.error('还没有接入批次。请先运行 npm run setup:feishu。');
-  store.close();
-  process.exit(1);
-}
 await initializeLocalData({ store, repository, config, dataDir });
 const sync = new FeishuSync({ store, repository });
 const feishuConfig = new FeishuConfigService({ store });
@@ -124,20 +123,36 @@ async function readJson(req) {
 
 async function api(req, res, url) {
   if (url.pathname === '/api/health' && req.method === 'GET') {
-    return sendJson(res, 200, { status: 'ok', database: { connected: true }, feishu: { mode: 'manual', configured: true } });
+    return sendJson(res, 200, { status: 'ok', database: { connected: true }, feishu: { mode: 'manual_one_way_backup', configured: Boolean(store.getMeta('exportSource')) } });
   }
   if (url.pathname.startsWith('/api/admin/')) return adminApi(req, res, url);
-  const match = url.pathname.match(/^\/api\/batches\/([^/]+)\/(catalog|orders|query|submissions\/([^/]+))$/);
+  const match = url.pathname.match(/^\/api\/batches\/([^/]+)\/(catalog|orders|query|quote|sams\/search|customer-products|submissions\/([^/]+))$/);
   if (!match) return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: '没有找到这个接口。' } });
   const batch = service.getBatch(decodeURIComponent(match[1]));
   const endpoint = match[2];
   if (endpoint === 'catalog' && req.method === 'GET') {
     return sendJson(res, 200, await service.getCatalog(batch));
   }
+  if (endpoint === 'sams/search' && req.method === 'GET') {
+    rateLimit(req, 'customer-sams-query');
+    return sendJson(res, 200, await customerSelection.search(batch, req.headers['x-customer-token'], Object.fromEntries(url.searchParams)));
+  }
+  if (endpoint === 'customer-products' && req.method === 'GET') {
+    rateLimit(req, 'customer-products');
+    return sendJson(res, 200, customerSelection.list(batch, req.headers['x-customer-token']));
+  }
+  if (endpoint === 'customer-products' && req.method === 'POST') {
+    rateLimit(req, 'customer-selection');
+    return sendJson(res, 200, await customerSelection.add(batch, req.headers['x-customer-token'], await readJson(req)));
+  }
   if (endpoint === 'orders' && req.method === 'POST') {
     rateLimit(req, 'order');
-    const result = await service.submit(batch, await readJson(req));
+    const result = await customerSelection.submit(batch, req.headers['x-customer-token'], await readJson(req));
     return sendJson(res, ['pending', 'processing', 'reconciling'].includes(result.status) ? 202 : 200, result);
+  }
+  if (endpoint === 'quote' && req.method === 'POST') {
+    rateLimit(req, 'order-quote');
+    return sendJson(res, 200, customerSelection.quote(batch, req.headers['x-customer-token'], await readJson(req)));
   }
   if (endpoint === 'query' && req.method === 'POST') {
     rateLimit(req, 'query');
@@ -145,7 +160,7 @@ async function api(req, res, url) {
     return sendJson(res, 200, await service.queryOrders(batch, body.phone));
   }
   if (endpoint.startsWith('submissions/') && req.method === 'GET') {
-    return sendJson(res, 200, await service.getSubmission(batch, decodeURIComponent(match[3])));
+    return sendJson(res, 200, customerSelection.receipt(batch, req.headers['x-customer-token'], decodeURIComponent(match[3])));
   }
   return sendJson(res, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: '此操作不支持该请求方式。' } });
 }
@@ -168,6 +183,29 @@ async function adminApi(req, res, url) {
   }
   if (endpoint === 'overview' && req.method === 'GET') return sendJson(res, 200, { ...service.overview(), shareOrigin: shareOrigin(), feishuUrl: store.getMeta('exportSource')?.feishuUrl });
   if (endpoint === 'products' && req.method === 'GET') return sendJson(res, 200, service.listProducts());
+  if (endpoint === 'sams/cities' && req.method === 'GET') return sendJson(res, 200, await sams.cities());
+  if (endpoint === 'sams/stores' && req.method === 'GET') return sendJson(res, 200, await sams.stores(url.searchParams.get('cityCode') || '440300'));
+  if (endpoint === 'sams/search' && req.method === 'GET') {
+    rateLimit(req, 'sams-query');
+    return sendJson(res, 200, await sams.search(Object.fromEntries(url.searchParams)));
+  }
+  if (endpoint === 'sams/ranks' && req.method === 'GET') {
+    rateLimit(req, 'sams-query');
+    return sendJson(res, 200, await sams.ranks(Object.fromEntries(url.searchParams)));
+  }
+  if (endpoint === 'sams/browse' && ['GET', 'POST'].includes(req.method)) {
+    rateLimit(req, 'sams-query');
+    return sendJson(res, 200, await sams.browse(req.method === 'POST' ? await readJson(req) : Object.fromEntries(url.searchParams)));
+  }
+  if (endpoint === 'products/select' && req.method === 'POST') {
+    const products = sams.resolveSelections(await readJson(req));
+    return sendJson(res, 200, service.selectProducts(products));
+  }
+  if (endpoint === 'products/status' && req.method === 'POST') {
+    return sendJson(res, 200, service.updateProductStatus(await readJson(req)));
+  }
+  const productMatch = endpoint.match(/^products\/([^/]+)$/);
+  if (productMatch && req.method === 'PATCH') return sendJson(res, 200, service.updateProduct(decodeURIComponent(productMatch[1]), await readJson(req)));
   if (endpoint === 'feishu/config' && req.method === 'GET') return sendJson(res, 200, feishuConfig.get());
   if (endpoint === 'feishu/config' && req.method === 'PUT') {
     const body = await readJson(req);
@@ -188,16 +226,18 @@ async function adminApi(req, res, url) {
     return sendJson(res, 202, jobs.start(`feishu-check:${JSON.stringify(body)}`, () => feishuConfig.check(body), { acceptErrorResult: true }));
   }
   if (endpoint === 'communities' && req.method === 'POST') return sendJson(res, 201, service.createCommunity(await readJson(req)));
-  if (endpoint === 'batches' && req.method === 'POST') return sendJson(res, 201, service.createBatch(await readJson(req)));
+  if (endpoint === 'batches' && req.method === 'POST') {
+    return sendJson(res, 201, await customerSelection.createBatch(await readJson(req)));
+  }
   if (endpoint === 'stats' && req.method === 'GET') {
     const codes = (url.searchParams.get('codes') || '').split(',').filter(Boolean);
     if (codes.length > 200) throw new DomainError(400, 'INVALID_BATCHES', '一次最多查看 200 期。');
     return sendJson(res, 200, service.getStats(codes));
   }
-  if (endpoint === 'sync/products' && req.method === 'POST') {
+  if (['sync/products', 'sync/products/backup'].includes(endpoint) && req.method === 'POST') {
     await readJson(req);
     if (jobs.active.has('feishu-save')) throw new DomainError(409, 'FEISHU_CONFIG_BUSY', '正在保存飞书配置，请完成后再同步。');
-    return sendJson(res, 202, jobs.start('products', () => sync.syncProducts()));
+    return sendJson(res, 202, jobs.start('products', () => sync.backupProducts()));
   }
   const jobMatch = endpoint.match(/^jobs\/([a-zA-Z0-9-]+)$/);
   if (jobMatch && req.method === 'GET') return sendJson(res, 200, jobs.get(jobMatch[1]));
@@ -205,7 +245,11 @@ async function adminApi(req, res, url) {
   if (batchMatch) {
     const code = decodeURIComponent(batchMatch[1]);
     service.getBatch(code);
-    if (!batchMatch[2] && req.method === 'PATCH') return sendJson(res, 200, service.updateBatch(code, await readJson(req)));
+    if (!batchMatch[2] && req.method === 'PATCH') {
+      const body = await readJson(req);
+      if (body && Object.hasOwn(body, 'samsStore')) body.samsStore = await customerSelection.validateStore(body.samsStore);
+      return sendJson(res, 200, service.updateBatch(code, body));
+    }
     if (batchMatch[2] === 'sync/orders' && req.method === 'POST') {
       await readJson(req);
       if (jobs.active.has('feishu-save')) throw new DomainError(409, 'FEISHU_CONFIG_BUSY', '正在保存飞书配置，请完成后再同步。');
@@ -250,7 +294,8 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url || '/', 'http://local.invalid');
     if (url.pathname.startsWith('/api/')) return await api(req, res, url);
     if (url.pathname === '/') {
-      res.writeHead(302, { Location: `/b/${encodeURIComponent(store.getMeta('defaultBatch'))}`, 'Cache-Control': 'no-store' });
+      const defaultBatch = store.getMeta('defaultBatch');
+      res.writeHead(302, { Location: defaultBatch ? `/b/${encodeURIComponent(defaultBatch)}` : '/admin', 'Cache-Control': 'no-store' });
       return res.end();
     }
     if (!['GET', 'HEAD'].includes(req.method)) return sendJson(res, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: '不支持该请求方式。' } });

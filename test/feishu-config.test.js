@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { LocalStore } from '../server/local-store.js';
 import { FeishuConfigService } from '../server/feishu-config.js';
-import { FeishuSync, EXPORT_FIELDS } from '../server/feishu-sync.js';
+import { FeishuSync, EXPORT_FIELDS, ORDER_FEE_SCHEMA, productDestination, productBackupArchiveKey } from '../server/feishu-sync.js';
 
 const token = 'OldBaseToken1234567890';
 const nextToken = 'NewBaseToken1234567890';
@@ -227,6 +227,51 @@ test('仅换商品表、URL或重复保存不重置订单映射；分页空洞�
   await assert.rejects(service.inspect({ baseToken: token }), { code: 'FEISHU_CONFIG_RESPONSE_INVALID' });
 });
 
+test('旧8字段商品表可检查保存，提示单向写入备份；已有扩展字段错误类型不通过', async t => {
+  const { service, api } = fixture(t);
+  const checked = await service.check(configInput(source));
+  assert.equal(checked.status, 'success');
+  assert.equal(checked.writeMode, 'manual_one_way_backup');
+  assert.match(checked.message, /本地商品库为主数据/);
+  assert.match(checked.message, /未验证写入权限/);
+  assert.deepEqual(checked.checks.products.fieldsToCreate, ['图片地址', '来源数据', '数据版本', '更新时间']);
+  await service.save({ ...configInput(source), revision: 0 });
+  assert.deepEqual(service.get().lastCheck.checks.products.fieldsToCreate, checked.checks.products.fieldsToCreate);
+  api.schemas.get(source.productTableId).push({ name: '来源数据', type: 'formula' });
+  const wrong = await service.check(configInput(source));
+  assert.equal(wrong.status, 'error');
+  assert.match(wrong.checks.products.missingFields.join(','), /来源数据（需 text 类型）/);
+});
+
+test('切换商品目标只标记备份待处理，保留本地主数据和订单；切回仍保留未知新增对账标记', async t => {
+  const { service, store, batch } = fixture(t);
+  const products = store.listProducts();
+  const orders = store.listExportLines(batch.code);
+  const oldBackup = { destination: productDestination(source), status: 'pending', records: {
+    P1: { recordId: 'old-product-record', revision: products[0].revision,
+      lastBackedUpAt: '2026-10-12T03:00:00Z', pendingCreate: { outcome: 'unknown', attemptId: 'previous-attempt' } },
+  }, lastSyncedAt: '2026-10-12T03:00:00Z' };
+  store.setMeta('feishu-product-backup', oldBackup);
+  const next = { ...configInput(source), productTableId: changed.productTableId };
+  const saved = await service.save({ ...next, revision: 0 });
+  assert.equal(saved.changedProductDestination, true);
+  assert.equal(saved.productsMarkedPending, 1);
+  assert.equal(saved.changedDestination, false);
+  assert.deepEqual(store.listProducts(), products);
+  assert.deepEqual(store.listExportLines(batch.code), orders);
+  assert.deepEqual(store.getMeta(productBackupArchiveKey(productDestination(source))), oldBackup);
+  const state = store.getMeta('feishu-product-backup');
+  assert.equal(state.destination, productDestination(next));
+  assert.equal(state.counts.pending, 1);
+  assert.deepEqual(state.records, {});
+  await service.save({ ...configInput(source), revision: 1 });
+  const restored = store.getMeta('feishu-product-backup');
+  assert.equal(restored.status, 'pending');
+  assert.equal(restored.records.P1.revision, 0);
+  assert.equal(restored.records.P1.pendingCreate.attemptId, 'previous-attempt');
+  assert.deepEqual(store.listProducts(), products);
+});
+
 test('带has_more的目录完成分页；无类型items和非安全lastCheck不对外返回', async t => {
   const { service, store, api } = fixture(t);
   api.pages = new Map([
@@ -249,4 +294,39 @@ test('带has_more的目录完成分页；无类型items和非安全lastCheck不�
   store.setMeta('feishu-config-last-check', metadata);
   assert.equal(service.get().lastCheck, undefined);
   assert.equal(service.get().revision, saved.revision);
+});
+
+test('旧订单表仍可检查保存，收费字段缺失明确提示；完整收费字段通过并保留能力信息', async t => {
+  const { service, api } = fixture(t);
+  const missingNames = Object.keys(ORDER_FEE_SCHEMA);
+  const legacy = await service.check(configInput(source));
+  assert.equal(legacy.status, 'success');
+  assert.equal(legacy.checks.orders.feeCompatible, false);
+  assert.deepEqual(legacy.checks.orders.missingFeeFields, missingNames);
+  assert.match(legacy.checks.orders.message, /仅支持零费订单备份/);
+  await service.save({ ...configInput(source), revision: 0 });
+  assert.deepEqual(service.get().lastCheck.checks.orders.missingFeeFields, missingNames);
+  const discovered = await service.inspect({ baseToken: token });
+  assert.equal(discovered.tables[1].orderCompatible, true);
+  assert.equal(discovered.tables[1].feeCompatible, false);
+  assert.deepEqual(discovered.tables[1].missingFeeFields, missingNames);
+  api.schemas.get(source.orderTableId).push(...Object.entries(ORDER_FEE_SCHEMA).map(([name, type]) => ({ name, type })));
+  await service.save({ ...configInput(source), revision: service.get().revision });
+  const complete = service.get().lastCheck;
+  assert.equal(complete.checks.orders.feeCompatible, true);
+  assert.deepEqual(complete.checks.orders.missingFeeFields, []);
+});
+
+test('可选收费字段已经存在时必须唯一且类型正确，缺少其他收费字段不掩盖错误', async t => {
+  const { service, api } = fixture(t);
+  const schema = api.schemas.get(source.orderTableId);
+  schema.push({ name: '同步代购费', type: 'formula' });
+  let checked = await service.check(configInput(source));
+  assert.equal(checked.status, 'error');
+  assert.match(checked.checks.orders.missingFields.join(','), /同步代购费（需 number 类型）/);
+  schema.at(-1).type = 'number';
+  schema.push({ name: '同步代购费', type: 'number' });
+  checked = await service.check(configInput(source));
+  assert.equal(checked.status, 'error');
+  assert.match(checked.checks.orders.missingFields.join(','), /同步代购费（字段名称重复）/);
 });

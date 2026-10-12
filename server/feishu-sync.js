@@ -6,7 +6,15 @@ const locks = new WeakMap();
 const PRODUCT_ID = /^[\p{L}\p{N}][\p{L}\p{N}_-]{0,127}$/u;
 const STATUSES = ['待采购', '已买到', '缺货', '已领取', '已取消'];
 export const EXPORT_FIELDS = ['明细编号', '提交编号', '团购ID', '小区/群名称', '期次', '手机号', '姓名', '商品ID', '数量', '备注', '处理状态', '提交时间', '同步状态', '预期明细数', '同步商品名称', '同步规格', '同步销售单位', '同步单价', '同步金额', '数据版本'];
-const NUMBER_FIELDS = new Set(['数量', '预期明细数', '同步单价', '同步金额', '数据版本']);
+// Optional on legacy tables; fee-bearing orders require the complete snapshot.
+export const ORDER_FEE_SCHEMA = { 同步代购费: 'number', 同步代购费率: 'number', 同步收费类别: 'text', 同步应付金额: 'number' };
+export const PRODUCT_SCHEMA = { 商品ID: 'text', 商品名称: 'text', 规格: 'text', 销售单位: 'text', 单价: 'number', 分类: 'text', 在售: 'checkbox', 排序: 'number' };
+export const PRODUCT_BACKUP_SCHEMA = { ...PRODUCT_SCHEMA, 图片地址: 'text', 来源数据: 'text', 数据版本: 'number', 更新时间: 'text' };
+export const PRODUCT_BACKUP_FIELDS = Object.keys(PRODUCT_BACKUP_SCHEMA);
+export const productDestination = source => `${source.baseToken}:${source.productTableId}`;
+export const productBackupArchiveKey = destination => `feishu-product-backup-archive:${destination}`;
+const NUMBER_FIELDS = new Set(['数量', '预期明细数', '同步单价', '同步金额', '数据版本', '同步代购费', '同步代购费率', '同步应付金额']);
+const FEE_CATEGORY_LABELS = { recommended: '推荐商品', selfSelected: '自选商品' };
 class SyncError extends Error {
   constructor(code, message) { super(message); this.code = code; }
 }
@@ -23,11 +31,31 @@ function same(row, desired, confirmed = false) {
   for (const [key, value] of Object.entries(desired)) {
     if (key === '同步状态') continue;
     const actual = row.fields[key];
-    if (NUMBER_FIELDS.has(key) ? Number(actual) !== value : key === '提交时间' ? timestamp(actual) !== timestamp(value) : text(actual) !== text(value)) return false;
+    if (NUMBER_FIELDS.has(key) ? actual == null || actual === '' || Number(actual) !== value : key === '提交时间' ? timestamp(actual) !== timestamp(value) : text(actual) !== text(value)) return false;
   }
   return !confirmed || text(row.fields['同步状态']) === '已确认';
 }
 const chunked = (items, size = 200) => Array.from({ length: Math.ceil(items.length / size) }, (_, i) => items.slice(i * size, (i + 1) * size));
+function feeSnapshot(line, amountCents) {
+  const supplied = ['feeCategory', 'feeRateBps', 'feeCents', 'payableCents'].some(key => Object.hasOwn(line, key));
+  const fee = supplied ? { category: line.feeCategory, rateBps: line.feeRateBps, cents: line.feeCents, payableCents: line.payableCents }
+    : { category: 'recommended', rateBps: 0, cents: 0, payableCents: amountCents };
+  if (!Object.hasOwn(FEE_CATEGORY_LABELS, fee.category) || !Number.isSafeInteger(amountCents) || amountCents < 0
+    || !Number.isSafeInteger(fee.rateBps) || fee.rateBps < 0 || fee.rateBps > 10_000
+    || !Number.isSafeInteger(fee.cents) || fee.cents < 0 || !Number.isSafeInteger(fee.payableCents)
+    || fee.payableCents !== amountCents + fee.cents || (fee.rateBps === 0 && fee.cents !== 0)
+    || (['已取消', '缺货'].includes(line.status) && (amountCents !== 0 || fee.cents !== 0))) {
+    throw new SyncError('LOCAL_EXPORT_FEE_INVALID', '本地订单收费快照不完整或金额不一致，未写入飞书。');
+  }
+  return fee;
+}
+function sameProduct(row, desired) {
+  return Boolean(row) && Object.entries(desired).every(([key, value]) => {
+    const actual = row.fields[key];
+    return PRODUCT_BACKUP_SCHEMA[key] === 'number' ? actual != null && Number(actual) === value
+      : PRODUCT_BACKUP_SCHEMA[key] === 'checkbox' ? actual === value : text(actual) === value;
+  });
+}
 
 export class FeishuSync {
   constructor({ store, sourceConfig, repository = new FeishuRepository(), larkCall = lark, readRecordsCall = readRecords, backoffMs = [500, 1500, 3000, 5000], createBatchViews = true }) {
@@ -43,52 +71,225 @@ export class FeishuSync {
   }
   source() {
     const source = this.sourceConfig || this.store.getMeta('exportSource');
-    if (!source?.baseToken || !source.productTableId || !source.orderTableId) throw new SyncError('SOURCE_NOT_CONFIGURED', '尚未配置飞书商品源和订单导出表。');
+    if (!source?.baseToken || !source.productTableId || !source.orderTableId) throw new SyncError('SOURCE_NOT_CONFIGURED', '尚未配置飞书商品备份表和订单导出表。');
     return source;
   }
-  syncProducts() {
+  // Compatibility entry point: product sync always flows from the local catalog to Feishu.
+  syncProducts() { return this.exportProducts(); }
+  backupProducts() { return this.exportProducts(); }
+  exportProducts() {
     return this.singleFlight('products', async () => {
-      const old = this.store.getMeta('feishu-products') || {};
+      let source;
+      let products = [];
+      let meta = this.store.getMeta('feishu-product-backup') || { records: {} };
+      const counts = { created: 0, updated: 0, unchanged: 0, total: 0, backedUp: 0, pending: 0 };
+      const save = () => {
+        const current = this.sourceConfig || this.store.getMeta('exportSource');
+        const key = meta.destination && current && productDestination(current) !== meta.destination
+          ? productBackupArchiveKey(meta.destination) : 'feishu-product-backup';
+        this.store.setMeta(key, meta);
+      };
+      const assertDestination = () => {
+        const current = this.sourceConfig || this.store.getMeta('exportSource');
+        if (!current || productDestination(current) !== meta.destination) {
+          throw new SyncError('PRODUCT_BACKUP_DESTINATION_CHANGED', '商品备份目标已变更，请对当前目标重新备份。');
+        }
+      };
+      const finish = (status, error = null) => {
+        const currentProducts = this.store.listProducts();
+        counts.total = currentProducts.length;
+        counts.backedUp = currentProducts.filter(product => {
+          const record = meta.records?.[product.id];
+          return record && !record.pendingCreate && record.revision === product.revision && record.lastBackedUpAt;
+        }).length;
+        counts.pending = counts.total - counts.backedUp;
+        if (status === 'success' && counts.pending) status = 'pending';
+        Object.assign(meta, { status, counts, pending: counts.pending, lastSyncedAt: meta.lastSyncedAt || null, error });
+        save();
+        return { ...meta, counts: { ...counts } };
+      };
       try {
-        const source = this.source();
-        const products = await this.repository.readProducts(source);
-        if (!Array.isArray(products)) throw new SyncError('PRODUCTS_INVALID', '飞书商品读取未完成，保留当前商品库。');
+        source = { ...this.source() };
+        const destination = productDestination(source);
+        if (meta.destination !== destination) meta = { destination, records: {} };
+        meta = { ...meta, records: structuredClone(meta.records || {}) };
+        products = structuredClone(this.store.listProducts());
         const ids = new Set();
         for (const product of products) {
           if (!PRODUCT_ID.test(product.id || '') || ids.has(product.id) || !product.name?.trim() || !product.spec?.trim() || !product.unit?.trim()
-            || !Number.isSafeInteger(product.priceCents) || product.priceCents < 0 || product.priceCents > 100_000_000 || typeof product.onSale !== 'boolean') {
-            throw new SyncError('PRODUCTS_INVALID', '飞书商品有重复编号、缺少资料或价格不合法；本地商品库未更新。');
+            || !Number.isSafeInteger(product.priceCents) || product.priceCents < 0 || product.priceCents > 100_000_000 || typeof product.onSale !== 'boolean'
+            || !Number.isSafeInteger(product.revision) || product.revision < 1 || !Number.isFinite(product.sort)
+            || !Number.isFinite(Date.parse(product.updatedAt))) {
+            throw new SyncError('LOCAL_PRODUCTS_INVALID', '本地商品有重复编号、缺少资料或价格不合法；未写入飞书。');
           }
           ids.add(product.id);
         }
-        const lastSyncedAt = new Date().toISOString();
-        const imported = this.store.importProducts(products, { source, lastSyncedAt });
-        const counts = imported?.counts || imported || {};
-        const result = { status: 'success', counts: { added: counts.added || 0, updated: counts.updated || 0,
-          offSale: counts.offSale ?? counts.offline ?? counts.disabled ?? 0, total: products.length }, lastSyncedAt, error: null };
-        this.store.setMeta('feishu-products', result);
-        return result;
+        const desired = new Map(products.map(product => [product.id, this.productFields(product)]));
+        assertDestination();
+        await this.ensureProductSchema(source, assertDestination);
+        assertDestination();
+        let index = await this.readProductIndex(source, products, meta.records);
+        // An unresolved create must become visible before another create for the same ID is allowed.
+        const uncertain = products.filter(product => meta.records[product.id]?.pendingCreate?.outcome !== 'settled'
+          && meta.records[product.id]?.pendingCreate && !index.has(product.id));
+        if (uncertain.length) {
+          const checked = await this.pollProducts(source, products, meta.records, rows => uncertain.every(product => rows.has(product.id)));
+          index = checked.index;
+          if (!checked.complete) return finish('pending', { code: 'REMOTE_PRODUCT_WRITE_PENDING', message: '商品新增结果尚未确认，已停止重复新增；请稍后再备份核查。' });
+        }
+        for (const product of products) if (index.has(product.id)) delete meta.records[product.id]?.pendingCreate;
+        save();
+        const missing = products.filter(product => !index.has(product.id));
+        for (const group of chunked(missing)) {
+          assertDestination();
+          const attemptId = randomUUID();
+          for (const product of group) meta.records[product.id] = { ...meta.records[product.id],
+            pendingCreate: { attemptId, revision: product.revision, outcome: 'unknown', startedAt: new Date().toISOString() } };
+          save();
+          let created;
+          try {
+            created = await this.larkCall(['base', '+record-batch-create', '--base-token', source.baseToken,
+              '--table-id', source.productTableId, '--json', JSON.stringify({ create_records: group.map(product => desired.get(product.id)) })], { write: true });
+          } catch (error) {
+            const outcome = error.outcome === 'settled' || error.uncertain === false ? 'settled' : 'unknown';
+            for (const product of group) meta.records[product.id].pendingCreate.outcome = outcome;
+            save(); throw error;
+          }
+          const recordIds = created?.record_id_list || created?.records?.map(row => row.record_id);
+          if (!Array.isArray(recordIds) || recordIds.length !== group.length || recordIds.some(id => typeof id !== 'string' || !id)
+            || new Set(recordIds).size !== recordIds.length) {
+            throw new SyncError('REMOTE_PRODUCT_WRITE_UNCONFIRMED', '飞书未确认全部商品新增结果，请稍后备份对账。');
+          }
+          group.forEach((product, i) => { meta.records[product.id].pendingCreate.ackRecordId = recordIds[i]; });
+          counts.created += group.length; save();
+        }
+        let checked = await this.pollProducts(source, products, meta.records, rows => products.every(product => rows.has(product.id)));
+        if (!checked.complete) return finish('pending', { code: 'REMOTE_PRODUCT_WRITE_PENDING', message: '商品已提交，等待飞书完整可见；本地商品保留。' });
+        index = checked.index;
+        const updates = [];
+        for (const product of products) {
+          const row = index.get(product.id);
+          if (!sameProduct(row, desired.get(product.id))) { updates.push([row.record_id, desired.get(product.id)]); counts.updated += 1; }
+          else if (!missing.some(item => item.id === product.id)) counts.unchanged += 1;
+        }
+        for (const group of chunked(updates)) {
+          assertDestination();
+          await this.larkCall(['base', '+record-batch-update', '--base-token', source.baseToken, '--table-id', source.productTableId,
+            '--json', JSON.stringify({ update_records: Object.fromEntries(group) })], { write: true });
+        }
+        checked = await this.pollProducts(source, products, meta.records,
+          rows => products.every(product => sameProduct(rows.get(product.id), desired.get(product.id))));
+        if (!checked.complete) return finish('pending', { code: 'REMOTE_PRODUCT_UPDATE_PENDING', message: '商品备份等待飞书读回确认，请稍后再次备份。' });
+        const lastBackedUpAt = new Date().toISOString();
+        for (const product of products) meta.records[product.id] = {
+          recordId: checked.index.get(product.id).record_id, revision: product.revision, lastBackedUpAt,
+        };
+        meta.lastSyncedAt = lastBackedUpAt;
+        assertDestination();
+        return finish('success');
       } catch (error) {
-        const result = { status: 'error', counts: { added: 0, updated: 0, offSale: 0, total: 0 }, lastSyncedAt: old.lastSyncedAt || null,
-          error: { code: String(error.code || 'PRODUCT_SYNC_FAILED'), message: error instanceof SyncError ? error.message : '同步商品失败，请检查飞书授权或稍后重试；本地商品库保留。' } };
-        this.store.setMeta('feishu-products', result);
-        return result;
+        return finish('error', { code: String(error.code || 'PRODUCT_BACKUP_FAILED'),
+          message: error instanceof SyncError ? error.message : '商品备份失败，请检查飞书写入权限或稍后重试；本地商品保留。' });
       }
     });
   }
+  productFields(product) {
+    return { 商品ID: product.id, 商品名称: product.name, 规格: product.spec, 销售单位: product.unit,
+      单价: product.priceCents / 100, 分类: product.category || '', 在售: product.onSale, 排序: product.sort,
+      图片地址: product.imageUrl || '', 来源数据: JSON.stringify(product.source ?? null), 数据版本: product.revision, 更新时间: product.updatedAt };
+  }
+  async ensureProductSchema(source, beforeWrite = () => {}) {
+    const read = async () => {
+      const result = await this.larkCall(['base', '+table-get', '--base-token', source.baseToken, '--table-id', source.productTableId]);
+      const fields = result?.fields || result?.table?.fields;
+      if (!Array.isArray(fields)) throw new SyncError('PRODUCT_BACKUP_SCHEMA_INVALID', '无法确认商品备份表结构，未写入商品。');
+      return fields;
+    };
+    const validate = (fields, required) => {
+      for (const [name, type] of Object.entries(required)) {
+        const matches = fields.filter(field => field.name === name);
+        if (matches.length !== 1 || matches[0].type !== type) {
+          throw new SyncError('PRODUCT_BACKUP_SCHEMA_INVALID', `商品备份表的「${name}」需为唯一的 ${type} 字段。`);
+        }
+      }
+    };
+    let fields = await read();
+    validate(fields, PRODUCT_SCHEMA);
+    const extraSchema = Object.fromEntries(Object.entries(PRODUCT_BACKUP_SCHEMA).filter(([name]) => !Object.hasOwn(PRODUCT_SCHEMA, name)));
+    validate(fields, Object.fromEntries(Object.entries(extraSchema).filter(([name]) => fields.some(field => field.name === name))));
+    const missing = Object.entries(extraSchema).filter(([name]) => !fields.some(field => field.name === name))
+      .map(([name, type]) => ({ name, type, ...(type === 'number' ? { style: { type: 'plain', precision: 0 } } : {}) }));
+    if (missing.length) {
+      beforeWrite();
+      await this.larkCall(['base', '+field-create', '--base-token', source.baseToken, '--table-id', source.productTableId,
+        '--json', JSON.stringify(missing)], { write: true });
+      fields = await read();
+    }
+    validate(fields, PRODUCT_BACKUP_SCHEMA);
+  }
+  async readProductIndex(source, products, records) {
+    const found = new Map();
+    for (const group of chunked(products)) {
+      const filter = { logic: 'or', conditions: group.map(product => ['商品ID', '==', product.id]) };
+      const rows = await this.readRecordsCall(source.baseToken, source.productTableId, PRODUCT_BACKUP_FIELDS, filter);
+      for (const row of rows) if (group.some(product => product.id === text(row.fields['商品ID']))) {
+        if (!row.record_id) throw new SyncError('REMOTE_PRODUCT_RESPONSE_INVALID', '飞书商品记录缺少记录编号，未写入商品。');
+        found.set(row.record_id, row);
+      }
+    }
+    const bound = products.flatMap(product => [records[product.id]?.recordId, records[product.id]?.pendingCreate?.ackRecordId].filter(Boolean));
+    for (const group of chunked([...new Set(bound.filter(id => !found.has(id)))])) {
+      const args = ['base', '+record-get', '--base-token', source.baseToken, '--table-id', source.productTableId];
+      for (const id of group) args.push('--record-id', id);
+      for (const field of PRODUCT_BACKUP_FIELDS) args.push('--field-id', field);
+      for (const row of normalizeRecords(await this.larkCall(args))) found.set(row.record_id, row);
+    }
+    // A completed backup binding remains authoritative even when both read paths temporarily omit it.
+    // Only pendingCreate.ackRecordId can wait for initial visibility; a confirmed record must never be recreated.
+    for (const product of products) {
+      const recordId = records[product.id]?.recordId;
+      if (recordId && !found.has(recordId)) {
+        throw new SyncError('REMOTE_PRODUCT_BOUND_RECORD_MISSING', '此前已备份的飞书商品记录暂不可见，已停止新增和更新；请核查原记录后再备份。');
+      }
+    }
+    const index = new Map();
+    const localIds = new Set(products.map(product => product.id));
+    for (const row of found.values()) {
+      const id = text(row.fields['商品ID']);
+      for (const product of products) if ([records[product.id]?.recordId, records[product.id]?.pendingCreate?.ackRecordId].includes(row.record_id)
+        && product.id !== id) throw new SyncError('REMOTE_PRODUCT_ID_CONFLICT', '飞书记录编号已对应其他商品，停止备份以免覆盖。');
+      if (!localIds.has(id)) continue;
+      if (index.has(id)) throw new SyncError('REMOTE_PRODUCT_DUPLICATE', '飞书存在重复商品编号，请先核查后再备份。');
+      index.set(id, row);
+    }
+    return index;
+  }
+  async pollProducts(source, products, records, predicate) {
+    let index;
+    for (const delay of [0, ...this.backoffMs]) {
+      if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+      index = await this.readProductIndex(source, products, records);
+      if (predicate(index)) return { index, complete: true };
+    }
+    return { index, complete: false };
+  }
   syncOrders(code) { return this.singleFlight(`orders:${code}`, () => this.exportOrders(code)); }
 
-  fields(batch, line) {
+  fields(batch, line, feeFields = []) {
     const product = line.product || {};
     const priceCents = line.priceCents ?? product.priceCents;
     const amountCents = line.amountCents ?? (['已取消', '缺货'].includes(line.status) ? 0 : priceCents * line.quantity);
+    const fee = feeSnapshot(line, amountCents);
+    const feeValues = { 同步代购费: fee.cents / 100, 同步代购费率: fee.rateBps / 100,
+      同步收费类别: FEE_CATEGORY_LABELS[fee.category], 同步应付金额: fee.payableCents / 100 };
     return { '明细编号': line.lineId, '提交编号': line.submissionId, '团购ID': batch.code,
       '小区/群名称': batch.communityName || line.communityName, '期次': batch.periodLabel || line.periodLabel || `第${batch.periodNumber}期`,
       '手机号': line.phone, '姓名': line.name, '商品ID': line.productId, '数量': line.quantity, '备注': line.note || '',
       '处理状态': [line.status], '提交时间': line.submittedAt, '同步状态': ['待确认'], '预期明细数': line.expectedLines,
       '同步商品名称': line.productName ?? product.name, '同步规格': line.spec ?? product.spec,
       '同步销售单位': line.unit ?? product.unit, '同步单价': priceCents / 100, '同步金额': amountCents / 100,
-      '数据版本': line.revision ?? line.version };
+      '数据版本': line.revision ?? line.version,
+      ...Object.fromEntries(feeFields.map(name => [name, feeValues[name]])) };
   }
   validateSnapshot(batch, lines) {
     const ids = new Set();
@@ -110,18 +311,33 @@ export class FeishuSync {
     for (const group of groups.values()) if (group.some(line => line.expectedLines !== group.length)) throw new SyncError('LOCAL_EXPORT_INCOMPLETE', '本地整单明细不完整，未写入飞书。');
     return groups;
   }
-  async verifySchema(source) {
+  async verifySchema(source, { requiresFees = false } = {}) {
     const result = await this.larkCall(['base', '+table-get', '--base-token', source.baseToken, '--table-id', source.orderTableId]);
-    const fields = new Set((result.fields || result.table?.fields || []).map(field => field.name));
-    if (EXPORT_FIELDS.some(field => !fields.has(field))) throw new SyncError('EXPORT_SCHEMA_MISSING', '订单导出表缺少同步字段，请先运行 setup:admin。');
+    const definitions = result.fields || result.table?.fields || [];
+    const names = new Set(definitions.map(field => field.name));
+    if (EXPORT_FIELDS.some(field => !names.has(field))) throw new SyncError('EXPORT_SCHEMA_MISSING', '订单导出表缺少同步字段，请先运行 setup:admin。');
+    const feeFields = [];
+    const missingFeeFields = [];
+    for (const [name, type] of Object.entries(ORDER_FEE_SCHEMA)) {
+      const matches = definitions.filter(field => field.name === name);
+      if (!matches.length) { missingFeeFields.push(name); continue; }
+      if (matches.length !== 1 || matches[0].type !== type) {
+        throw new SyncError('EXPORT_FEE_SCHEMA_INVALID', `订单导出表的「${name}」需为唯一的 ${type} 字段；本地订单已保存，未写入飞书。`);
+      }
+      feeFields.push(name);
+    }
+    if (requiresFees && missingFeeFields.length) {
+      throw new SyncError('EXPORT_FEE_SCHEMA_MISSING', `本地订单已保存；飞书订单表缺少收费字段：${missingFeeFields.map(name => `「${name}」(${ORDER_FEE_SCHEMA[name]})`).join('、')}。请手动补齐后重试备份，本次未写入飞书。`);
+    }
+    return { feeFields, missingFeeFields, feeCompatible: !missingFeeFields.length };
   }
-  async remoteRows(source, batch, lines) {
+  async remoteRows(source, batch, lines, exportFields = EXPORT_FIELDS) {
     const found = new Map();
     const chunks = chunked(lines, 199);
     if (!chunks.length) chunks.push([]);
     for (const group of chunks) {
       const filter = { logic: 'or', conditions: [['团购ID', '==', batch.code], ...group.map(line => ['明细编号', '==', line.lineId])] };
-      const rows = await this.readRecordsCall(source.baseToken, source.orderTableId, EXPORT_FIELDS, filter);
+      const rows = await this.readRecordsCall(source.baseToken, source.orderTableId, exportFields, filter);
       for (const row of rows) if (text(row.fields['团购ID']) === batch.code || group.some(line => text(row.fields['明细编号']) === line.lineId)) found.set(row.record_id, row);
     }
     // A persisted remote ID is a hint only; verify its actual line/batch before writing it.
@@ -129,7 +345,7 @@ export class FeishuSync {
     for (const ids of chunked([...new Set(storedIds)])) {
       const args = ['base', '+record-get', '--base-token', source.baseToken, '--table-id', source.orderTableId];
       for (const id of ids) args.push('--record-id', id);
-      for (const field of EXPORT_FIELDS) args.push('--field-id', field);
+      for (const field of exportFields) args.push('--field-id', field);
       const raw = await this.larkCall(args);
       for (const row of normalizeRecords(raw)) found.set(row.record_id, row);
     }
@@ -159,10 +375,10 @@ export class FeishuSync {
     }
     return index;
   }
-  async poll(source, batch, lines, valid) {
+  async poll(source, batch, lines, valid, exportFields = EXPORT_FIELDS) {
     let latest;
     for (let attempt = 0; attempt <= this.backoffMs.length; attempt += 1) {
-      latest = this.indexRemote(batch, lines, await this.remoteRows(source, batch, lines));
+      latest = this.indexRemote(batch, lines, await this.remoteRows(source, batch, lines, exportFields));
       if (valid(latest)) return { index: latest, complete: true };
       if (attempt < this.backoffMs.length) await new Promise(resolve => setTimeout(resolve, this.backoffMs[attempt]));
     }
@@ -172,7 +388,7 @@ export class FeishuSync {
     for (const group of chunked(entries)) await this.larkCall(['base', '+record-batch-update', '--base-token', source.baseToken,
       '--table-id', source.orderTableId, '--json', JSON.stringify({ update_records: Object.fromEntries(group) })], { write: true });
   }
-  async batchView(source, batch) {
+  async batchView(source, batch, feeFields = []) {
     if (!this.createBatchViews) return null;
     const viewName = `${batch.communityName} ${batch.periodLabel || `第${batch.periodNumber}期`} · ${batch.code}`.slice(0, 100);
     const listArgs = ['base', '+view-list', '--base-token', source.baseToken, '--table-id', source.orderTableId];
@@ -189,7 +405,7 @@ export class FeishuSync {
     await this.larkCall(['base', '+view-set-filter', '--base-token', source.baseToken, '--table-id', source.orderTableId,
       '--view-id', id, '--json', JSON.stringify({ logic: 'and', conditions: [['团购ID', '==', batch.code], ['同步状态', 'intersects', ['已确认']], ['处理状态', 'disjoint', ['已取消', '缺货']], ['数量', '>', 0]] })], { write: true });
     await this.larkCall(['base', '+view-set-visible-fields', '--base-token', source.baseToken, '--table-id', source.orderTableId,
-      '--view-id', id, '--json', JSON.stringify({ visible_fields: ['小区/群名称', '期次', '手机号', '姓名', '同步商品名称', '同步规格', '同步销售单位', '数量', '同步单价', '同步金额', '处理状态', '备注', '提交时间'] })], { write: true });
+      '--view-id', id, '--json', JSON.stringify({ visible_fields: ['小区/群名称', '期次', '手机号', '姓名', '同步商品名称', '同步规格', '同步销售单位', '数量', '同步单价', '同步金额', ...feeFields, '处理状态', '备注', '提交时间'] })], { write: true });
     if (!source.feishuUrl) return null;
     const url = new URL(source.feishuUrl); url.searchParams.set('table', source.orderTableId); url.searchParams.set('view', id);
     return url.toString();
@@ -213,14 +429,16 @@ export class FeishuSync {
       if (!batch) throw new SyncError('BATCH_NOT_FOUND', '本期团购不存在。');
       lines = this.store.listExportLines(code, { onlyDirty: false });
       this.validateSnapshot(batch, lines);
-      await this.verifySchema(source);
-      const desired = new Map(lines.map(line => [line.lineId, this.fields(batch, line)]));
-      let index = this.indexRemote(batch, lines, await this.remoteRows(source, batch, lines));
+      const requiresFees = lines.some(line => (line.feeRateBps ?? 0) > 0 || (line.feeCents ?? 0) > 0);
+      const schema = await this.verifySchema(source, { requiresFees });
+      const exportFields = [...EXPORT_FIELDS, ...schema.feeFields];
+      const desired = new Map(lines.map(line => [line.lineId, this.fields(batch, line, schema.feeFields)]));
+      let index = this.indexRemote(batch, lines, await this.remoteRows(source, batch, lines, exportFields));
       for (const line of lines) if (index.has(line.lineId)) delete meta.pendingCreates[line.lineId];
       save();
       const unresolved = lines.filter(line => !index.has(line.lineId) && meta.pendingCreates[line.lineId]?.outcome !== 'settled' && meta.pendingCreates[line.lineId]);
       if (unresolved.length) {
-        const checked = await this.poll(source, batch, lines, rows => unresolved.every(line => rows.has(line.lineId)));
+        const checked = await this.poll(source, batch, lines, rows => unresolved.every(line => rows.has(line.lineId)), exportFields);
         index = checked.index;
         for (const line of unresolved) if (index.has(line.lineId)) delete meta.pendingCreates[line.lineId];
         save();
@@ -246,7 +464,7 @@ export class FeishuSync {
         group.forEach((line, i) => { meta.pendingCreates[line.lineId].ackRecordId = ids[i]; });
         counts.created += group.length; save();
       }
-      let checked = await this.poll(source, batch, lines, rows => lines.every(line => rows.has(line.lineId)));
+      let checked = await this.poll(source, batch, lines, rows => lines.every(line => rows.has(line.lineId)), exportFields);
       index = checked.index;
       if (!checked.complete) return finish('pending', { code: 'REMOTE_WRITE_PENDING', message: '明细已提交，等待飞书完整可见；本地订单不受影响。' });
       for (const line of lines) delete meta.pendingCreates[line.lineId];
@@ -261,16 +479,16 @@ export class FeishuSync {
         if (changedSubmissions.has(line.submissionId) && (!same(row, value) || text(row.fields['同步状态']) !== '待确认')) updates.push([row.record_id, value]);
       }
       await this.update(source, updates);
-      checked = await this.poll(source, batch, lines, rows => lines.every(line => same(rows.get(line.lineId), desired.get(line.lineId))));
+      checked = await this.poll(source, batch, lines, rows => lines.every(line => same(rows.get(line.lineId), desired.get(line.lineId))), exportFields);
       if (!checked.complete) return finish('pending', { code: 'REMOTE_UPDATE_PENDING', message: '订单更新等待飞书确认，请稍后再次同步。' });
       index = checked.index;
       await this.update(source, lines.filter(line => text(index.get(line.lineId).fields['同步状态']) !== '已确认')
         .map(line => [index.get(line.lineId).record_id, { '同步状态': ['已确认'] }]));
-      checked = await this.poll(source, batch, lines, rows => lines.every(line => same(rows.get(line.lineId), desired.get(line.lineId), true)));
+      checked = await this.poll(source, batch, lines, rows => lines.every(line => same(rows.get(line.lineId), desired.get(line.lineId), true)), exportFields);
       if (!checked.complete) return finish('pending', { code: 'REMOTE_CONFIRM_PENDING', message: '飞书整单确认仍在处理中，请稍后再次同步。' });
       for (const line of lines) this.store.markExported(code, line.lineId, line.revision ?? line.version, checked.index.get(line.lineId).record_id);
       meta.lastSyncedAt = new Date().toISOString(); meta.error = null;
-      try { meta.viewUrl = await this.batchView(source, batch) || meta.viewUrl || null; } catch { /* View creation is optional; it never invalidates confirmed data. */ }
+      try { meta.viewUrl = await this.batchView(source, batch, schema.feeFields) || meta.viewUrl || null; } catch { /* View creation is optional; it never invalidates confirmed data. */ }
       lines = this.store.listExportLines(code, { onlyDirty: false });
       return finish(lines.some(line => Number(line.revision ?? line.version) > Number(line.syncedRevision ?? line.syncedVersion ?? 0)) ? 'pending' : 'success');
     } catch (error) {

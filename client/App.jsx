@@ -1,5 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createSubmissionId } from './submission-id.js';
+import CustomerSamsSearch from './CustomerSamsSearch.jsx';
+import ProductDescription from './ProductDescription.jsx';
+import OrderFees, { FeePolicyNotice, percent } from './OrderFees.jsx';
 
 const money = cents => `¥${((cents || 0) / 100).toFixed(2)}`;
 const cleanPhone = value => {
@@ -10,11 +13,28 @@ const cleanPhone = value => {
   return phone;
 };
 const activeStatuses = new Set(['pending', 'processing', 'reconciling']);
-const isDefiniteRejection = error => error.code?.startsWith('INVALID_') || ['PRODUCT_CHANGED', 'COLLECTION_CLOSED', 'BATCH_ENDED', 'JSON_REQUIRED', 'REQUEST_TOO_LARGE'].includes(error.code);
+const changedProduct = error => ['PRODUCT_CHANGED', 'SELF_PRODUCT_CHANGED', 'FEE_POLICY_CHANGED', 'FEE_QUOTE_CHANGED'].includes(error.code);
+const customerTokenError = error => ['CUSTOMER_TOKEN_MISMATCH', 'CUSTOMER_TOKEN_REQUIRED', 'INVALID_CUSTOMER_TOKEN'].includes(error.code);
+const isDefiniteRejection = error => error.code?.startsWith('INVALID_') || ['PRODUCT_CHANGED', 'SELF_PRODUCT_CHANGED', 'FEE_POLICY_CHANGED', 'FEE_QUOTE_CHANGED', 'COLLECTION_CLOSED', 'BATCH_ENDED', 'JSON_REQUIRED', 'REQUEST_TOO_LARGE'].includes(error.code);
 const labels = { pending: '待采购', purchased: '已买到', out_of_stock: '缺货', collected: '已领取', cancelled: '已取消', canceled: '已取消' };
 const readStored = (key, fallback) => { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } };
 const saveStored = (key, value) => { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* Browsing remains available without storage. */ } };
 const removeStored = key => { try { localStorage.removeItem(key); } catch { /* Storage can be unavailable in private browsing. */ } };
+const productDescription = product => product?.description?.trim() || (product?.spec !== '详见商品名称' ? product?.spec?.trim() : '') || '';
+const knownPrice = product => Number.isSafeInteger(product?.priceCents) && product.priceCents >= 0;
+const purchasable = product => product?.onSale === true && product?.selectable !== false && knownPrice(product);
+const personalStorageError = '当前浏览器无法保存个人清单，请允许本站保存数据后重试，或使用 Safari / Chrome 打开本期链接。';
+
+function customerIdentity(key) {
+  try {
+    let token = localStorage.getItem(key);
+    if (token && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(token)) return { token: null, error: '个人清单身份信息无法识别，请联系团长协助恢复。' };
+    if (!token) token = createSubmissionId();
+    localStorage.setItem(key, token);
+    if (localStorage.getItem(key) !== token) throw new Error('Storage unavailable');
+    return { token, error: '' };
+  } catch { return { token: null, error: personalStorageError }; }
+}
 
 function Icon({ name, size = 20, ...props }) {
   const paths = {
@@ -51,11 +71,21 @@ function ProductImage({ product, className = '' }) {
   return <img className={className} src={product.imageUrl || '/images/placeholder.svg'} alt={product.name || '商品图片'} loading="lazy" onError={event => { const target = event.currentTarget; if (!target.src.endsWith('/images/placeholder.svg')) target.src = '/images/placeholder.svg'; }} />;
 }
 
-function Stepper({ product, quantity, onChange, disabled }) {
+function Stepper({ product, quantity, onChange, disabled, increaseDisabled = false }) {
   return <div className={`stepper ${quantity ? 'has-quantity' : ''}`} aria-label={`${product.name}购买数量`}>
     {quantity > 0 && <><button type="button" aria-label={`减少${product.name}数量`} disabled={disabled} onClick={() => onChange(quantity - 1)}><Icon name="minus" size={16} /></button><span aria-live="polite">{quantity}</span></>}
-    <button type="button" className="add-button" aria-label={`增加${product.name}数量`} disabled={disabled || quantity >= 99} onClick={() => onChange(quantity + 1)}><Icon name="plus" size={18} />{!quantity && <span>加购</span>}</button>
+    <button type="button" className="add-button" aria-label={`增加${product.name}数量`} disabled={disabled || increaseDisabled || quantity >= 99} onClick={() => onChange(quantity + 1)}><Icon name="plus" size={18} />{!quantity && <span>加购</span>}</button>
   </div>;
+}
+
+function CustomerProductCard({ product, quantity, disabled, adding = false, onChange, onRefresh, feePolicy }) {
+  const description = productDescription(product);
+  const selfSelectedFee = product.feeCategory ? product.feeCategory === 'selfSelected' : product.selfSelected;
+  const feeRate = selfSelectedFee ? feePolicy?.selfSelectedRateBps ?? feePolicy?.recommendedRateBps ?? 0 : feePolicy?.recommendedRateBps ?? 0;
+  return <article className={`product-card customer-product-card ${!purchasable(product) ? 'sold-out' : ''}`}>
+    <div className="product-visual"><ProductImage product={product} />{product.selfSelected && <span className="self-selected-label">自选</span>}</div>
+    <div className="product-details"><h3>{product.name}</h3><ProductDescription text={description} className="product-description" name={product.name} />{feeRate > 0 && <p className="customer-product-fee">另收 {percent(feeRate)} 代购费</p>}<div className="product-bottom"><div className="price"><span>{knownPrice(product) ? money(product.priceCents) : '暂无法报价'}</span>{knownPrice(product) && <small> / {product.unit || '件'}</small>}</div><Stepper product={product} quantity={quantity} disabled={disabled || adding || !purchasable(product)} increaseDisabled={product.quoteExpired} onChange={onChange} /></div>{adding ? <p className="customer-product-status" role="status">正在加入购物车…</p> : (product.quoteExpired || !purchasable(product)) && <p className="customer-product-status">{product.quoteExpired ? '报价已过期，请重新查询' : !knownPrice(product) ? '价格未提供，暂时无法购买' : '暂不可购买'}</p>}{product.quoteExpired && onRefresh && <button type="button" className="text-button" disabled={disabled} onClick={onRefresh}>重新查询报价</button>}</div>
+  </article>;
 }
 
 function EmptyState({ icon = 'bag', title, description, children }) {
@@ -67,13 +97,24 @@ export default function App() {
   const base = `/api/batches/${encodeURIComponent(code)}`;
   const cartKey = `sam-cart:${code}`;
   const pendingKey = `sam-pending:${code}`;
+  const customerKey = `sam-customer:${code}`;
+  const customerProductsKey = `sam-customer-products:${code}`;
+  const [identity, setIdentity] = useState(() => customerIdentity(customerKey));
+  const [customerProducts, setCustomerProducts] = useState(() => {
+    const saved = readStored(customerProductsKey, null);
+    return saved?.token === identity.token && Array.isArray(saved.products) ? saved.products : [];
+  });
+  const [customerState, setCustomerState] = useState('loading');
+  const [customerError, setCustomerError] = useState('');
+  const [customerAdding, setCustomerAdding] = useState('');
+  const [samsSearchOpen, setSamsSearchOpen] = useState(false);
+  const [samsInitialKeyword, setSamsInitialKeyword] = useState('');
   const [view, setView] = useState(() => ['cart', 'query'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'products');
   const [catalog, setCatalog] = useState(null);
   const [catalogState, setCatalogState] = useState('loading');
   const [catalogError, setCatalogError] = useState('');
   const [cart, setCart] = useState(() => readStored(cartKey, {}));
   const [search, setSearch] = useState('');
-  const [category, setCategory] = useState('全部');
   const [form, setForm] = useState(() => {
     const payload = readStored(pendingKey, null)?.payload;
     return { name: payload?.name || '', phone: payload?.phone || '', note: payload?.note || '' };
@@ -87,23 +128,142 @@ export default function App() {
   const [queryError, setQueryError] = useState('');
   const [queryResult, setQueryResult] = useState(null);
   const [notification, setNotification] = useState('');
+  const [cartQuote, setCartQuote] = useState(null);
+  const [quoteState, setQuoteState] = useState('idle');
+  const [quoteError, setQuoteError] = useState('');
+  const [quoteRefresh, setQuoteRefresh] = useState(0);
   const latestRef = useRef({ cart, form, submission });
   latestRef.current = { cart, form, submission };
   const formRef = useRef(null);
   const searchInputRef = useRef(null);
   const queryFormRef = useRef(null);
   const queryInputRef = useRef(null);
+  const customerController = useRef(null);
+  const customerGeneration = useRef(0);
+  const customerAddingRef = useRef(false);
+  const appAlive = useRef(true);
   const products = catalog?.products || [];
-  const productMap = useMemo(() => new Map(products.map(product => [product.id, product])), [products]);
+  const catalogProductMap = useMemo(() => new Map(products.map(product => [product.id, product])), [products]);
+  const productMap = useMemo(() => new Map([...customerProducts, ...products].map(product => [product.id, product])), [products, customerProducts]);
   const items = useMemo(() => Object.entries(cart).filter(([, quantity]) => Number.isInteger(quantity) && quantity > 0).map(([id, quantity]) => ({ product: productMap.get(id), id, quantity })), [cart, productMap]);
   const itemCount = items.reduce((sum, item) => sum + item.quantity, 0);
   const cartTotal = items.reduce((sum, item) => sum + (item.product?.priceCents || 0) * item.quantity, 0);
-  const hasUnavailable = items.some(item => !item.product || !item.product.onSale);
-  const working = activeStatuses.has(submission?.status) || submission?.requiresReview || submitBusy;
+  const hasUnavailable = items.some(item => !purchasable(item.product));
+  const hasPersonalItems = items.some(item => item.product?.selfSelected || item.id.startsWith('self_') || !catalogProductMap.has(item.id));
+  const personalUnresolved = hasPersonalItems && (customerState !== 'ready' || Boolean(identity.error));
+  const knownCartTotal = items.every(item => knownPrice(item.product)) && !personalUnresolved;
+  const orderWorking = activeStatuses.has(submission?.status) || submission?.requiresReview || submitBusy;
+  const working = orderWorking || Boolean(customerAdding);
   const cutoffPassed = catalog?.batch.cutoffAt && new Date(catalog.batch.cutoffAt).getTime() <= Date.now();
   const collecting = Boolean(catalog?.batch.collecting && !cutoffPassed && catalogState === 'ready');
-  const categories = ['全部', ...new Set(products.map(product => product.category).filter(Boolean))];
-  const shownProducts = products.filter(product => (category === '全部' || product.category === category) && `${product.name} ${product.spec} ${product.id}`.toLowerCase().includes(search.trim().toLowerCase()));
+  const shownProducts = products.filter(product => `${product.name} ${product.spec} ${product.id}`.toLowerCase().includes(search.trim().toLowerCase()));
+  const personalProducts = customerProducts.filter(product => !catalogProductMap.has(product.id));
+  const quotePhone = cleanPhone(form.phone);
+  const quoteInput = {
+    items: items.map(item => ({ productId: item.id, quantity: item.quantity, version: item.product?.version })).sort((a, b) => a.productId.localeCompare(b.productId)),
+    phone: /^1[3-9]\d{9}$/.test(quotePhone) ? quotePhone : '',
+    feePolicyVersion: catalog?.batch.feePolicyVersion,
+  };
+  const quoteKey = JSON.stringify(quoteInput);
+  const confirmedQuote = cartQuote?.key === quoteKey ? cartQuote.billing : null;
+  const quoteReady = Boolean(confirmedQuote && quoteState === 'ready');
+
+  const requireCustomerToken = useCallback(() => {
+    try {
+      if (!identity.token || localStorage.getItem(customerKey) !== identity.token) throw new Error('Customer identity unavailable');
+      localStorage.setItem(customerKey, identity.token);
+      if (localStorage.getItem(customerKey) !== identity.token) throw new Error('Customer identity unavailable');
+      return identity.token;
+    } catch {
+      const error = new Error(identity.error || personalStorageError);
+      error.code = 'CUSTOMER_STORAGE_UNAVAILABLE';
+      setIdentity(previous => ({ ...previous, error: error.message }));
+      throw error;
+    }
+  }, [customerKey, identity.token, identity.error]);
+
+  const customerApi = useCallback((path, options = {}) => {
+    const token = requireCustomerToken();
+    return api(path, { ...options, headers: { ...options.headers, 'X-Customer-Token': token } });
+  }, [requireCustomerToken]);
+
+  function orderApi(path, options = {}) {
+    return api(path, { ...options, headers: { ...options.headers, ...(identity.token ? { 'X-Customer-Token': identity.token } : {}) } });
+  }
+
+  const loadCustomerProducts = useCallback(async ({ silent = false } = {}) => {
+    customerController.current?.abort();
+    const generation = ++customerGeneration.current;
+    const controller = new AbortController();
+    customerController.current = controller;
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, 20000);
+    if (!silent) setCustomerState('loading');
+    try {
+      const result = await customerApi(`${base}/customer-products`, { signal: controller.signal });
+      if (!appAlive.current || generation !== customerGeneration.current) return;
+      if (!Array.isArray(result.products)) throw new Error('个人清单暂时无法恢复，请重试。');
+      setCustomerProducts(result.products); setCustomerState('ready'); setCustomerError('');
+      saveStored(customerProductsKey, { token: identity.token, products: result.products });
+      return result;
+    } catch (error) {
+      if (!appAlive.current || generation !== customerGeneration.current || error.name === 'AbortError' && !timedOut) return;
+      setCustomerState('error'); setCustomerError(timedOut ? '个人清单恢复超时，请重试。' : error.message || '个人清单暂时无法恢复，请重试。');
+      throw error;
+    } finally { clearTimeout(timer); }
+  }, [base, customerApi, customerProductsKey, identity.token]);
+
+  function retryPersonalProducts() {
+    if (identity.error || !identity.token) {
+      const next = customerIdentity(customerKey);
+      setIdentity(next);
+      if (next.error) setCustomerError(next.error);
+    } else loadCustomerProducts().catch(() => {});
+  }
+
+  function persistPersonalCart(next, requireIdentity = true) {
+    if (requireIdentity) requireCustomerToken();
+    const value = JSON.stringify(next);
+    try {
+      localStorage.setItem(cartKey, value);
+      if (localStorage.getItem(cartKey) !== value) throw new Error('Cart storage unavailable');
+    } catch { throw new Error('购物车暂时无法保存，请允许浏览器保存本站数据后再加入商品。'); }
+  }
+
+  function openSamsSearch(value = search) {
+    setSamsInitialKeyword(String(value || '').trim().slice(0, 80)); setSamsSearchOpen(true);
+  }
+
+  async function addCustomerProduct(product, selectionId) {
+    if (customerAddingRef.current || !collecting || working || !purchasable(product)) return;
+    requireCustomerToken();
+    customerController.current?.abort(); customerGeneration.current += 1;
+    customerAddingRef.current = true; setCustomerAdding(product.id); setCustomerError('');
+    try {
+      const result = await customerApi(`${base}/customer-products`, { method: 'POST', body: JSON.stringify({ selectionId, spuId: product.spuId }) });
+      if (!appAlive.current) return;
+      const saved = result.product;
+      if (!saved?.id || !purchasable(saved)) throw new Error('此商品暂时无法购买，请重新查询。');
+      setCustomerProducts(previous => {
+        const next = [...previous.filter(item => item.id !== saved.id), saved];
+        saveStored(customerProductsKey, { token: identity.token, products: next });
+        return next;
+      });
+      setCustomerState('ready');
+      const nextCart = { ...latestRef.current.cart, [saved.id]: Math.min(99, (Number(latestRef.current.cart[saved.id]) || 0) + 1) };
+      persistPersonalCart(nextCart);
+      latestRef.current.cart = nextCart; setCart(nextCart);
+      if (latestRef.current.submission?.status === 'completed') setSubmission(null);
+      setNotification(`已加入购物车：${saved.name}`);
+      return saved;
+    } catch (error) {
+      if (changedProduct(error)) await refreshProducts().catch(() => {});
+      throw error;
+    } finally {
+      customerAddingRef.current = false;
+      if (appAlive.current) { setCustomerAdding(''); loadCustomerProducts({ silent: true }).catch(() => {}); }
+    }
+  }
 
   function updateForm(event) {
     // Native fields retain IME text even when an embedded browser misses a change event.
@@ -139,7 +299,54 @@ export default function App() {
     }
   }
 
+  async function refreshProducts() {
+    return await Promise.allSettled([loadCatalog({ silent: true }), loadCustomerProducts()]);
+  }
+
+  useEffect(() => {
+    if (working) return;
+    setCartQuote(null); setQuoteError('');
+    if (view !== 'cart' || !items.length || !knownCartTotal || hasUnavailable || !collecting) {
+      setQuoteState('idle'); return;
+    }
+    let disposed = false;
+    const controller = new AbortController();
+    let timeout;
+    setQuoteState('loading');
+    const debounce = setTimeout(async () => {
+      timeout = setTimeout(() => controller.abort(), 12000);
+      try {
+        const result = await api(`${base}/quote`, {
+          method: 'POST', body: quoteKey, signal: controller.signal,
+          headers: identity.token ? { 'X-Customer-Token': identity.token } : {},
+        });
+        if (disposed) return;
+        if (!Number.isSafeInteger(result.goodsTotalCents) || !Number.isSafeInteger(result.feeTotalCents)
+          || !Number.isSafeInteger(result.totalCents) || result.goodsTotalCents < 0 || result.feeTotalCents < 0
+          || result.totalCents !== result.goodsTotalCents + result.feeTotalCents
+          || result.feePolicyVersion !== catalog?.batch.feePolicyVersion || !/^[a-f0-9]{64}$/.test(result.feeQuoteVersion || '') || !Array.isArray(result.feeBreakdown)) {
+          throw new Error('费用核对结果暂不可用，请重新核对。');
+        }
+        setCartQuote({ key: quoteKey, billing: result }); setQuoteState('ready');
+      } catch (error) {
+        if (disposed) return;
+        setQuoteState('error');
+        setQuoteError(error.name === 'AbortError' ? '费用核对超时，请重新核对后提交。' : error.message);
+        if (changedProduct(error)) {
+          setSubmitError(error.code === 'FEE_POLICY_CHANGED' ? '本期收费规则已更新，请核对新的费用后再次提交。' : error.code === 'FEE_QUOTE_CHANGED' ? '本期订单已调整，请核对新的费用后再次提交。' : '商品信息已更新，请核对当前价格后再次提交。');
+          await refreshProducts();
+        }
+      } finally { clearTimeout(timeout); }
+    }, 250);
+    return () => { disposed = true; clearTimeout(debounce); clearTimeout(timeout); controller.abort(); };
+  }, [quoteKey, view, knownCartTotal, hasUnavailable, collecting, working, identity.token, quoteRefresh]);
+
   useEffect(() => { loadCatalog().catch(() => {}); }, [code]);
+  useEffect(() => {
+    appAlive.current = true;
+    loadCustomerProducts().catch(() => {});
+    return () => { appAlive.current = false; customerGeneration.current += 1; customerController.current?.abort(); };
+  }, [loadCustomerProducts]);
   useEffect(() => { saveStored(cartKey, cart); }, [cartKey, cart]);
   useEffect(() => {
     const handler = () => setView(['cart', 'query'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'products');
@@ -153,11 +360,15 @@ export default function App() {
   }, [notification]);
   useEffect(() => {
     if (!catalog) return;
-    const timer = setInterval(() => loadCatalog({ silent: true }).catch(() => {}), 60000);
-    const refresh = () => { if (document.visibilityState === 'visible') loadCatalog({ silent: true }).catch(() => {}); };
-    document.addEventListener('visibilitychange', refresh);
-    return () => { clearInterval(timer); document.removeEventListener('visibilitychange', refresh); };
-  }, [code, Boolean(catalog)]);
+    const refresh = () => {
+      loadCatalog({ silent: true }).catch(() => {});
+      if (identity.token && !identity.error) loadCustomerProducts({ silent: true }).catch(() => {});
+    };
+    const timer = setInterval(refresh, 60000);
+    const onVisible = () => { if (document.visibilityState === 'visible') refresh(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => { clearInterval(timer); document.removeEventListener('visibilitychange', onVisible); };
+  }, [code, Boolean(catalog), loadCustomerProducts, identity.token, identity.error]);
 
   function navigate(next) {
     location.hash = next === 'products' ? '' : next;
@@ -187,31 +398,35 @@ export default function App() {
     if (payload) { value.submissionId = payload.submissionId; value.status = 'pending'; }
     setSubmission(value);
     saveStored(pendingKey, value);
-    setSubmitError('本次提交编号的内容需要核对，请联系代购并提供下方提交编号。请勿重复下单。');
+    setSubmitError(customerTokenError(error) ? '本次提交的浏览器身份无法确认，请联系团长并提供下方提交编号核对。请勿重复下单。' : '本次提交编号的内容需要核对，请联系代购并提供下方提交编号。请勿重复下单。');
   }
 
   useEffect(() => {
-    if (!activeStatuses.has(submission?.status) || submission?.requiresReview) return;
+    if (submitBusy || !activeStatuses.has(submission?.status) || submission?.requiresReview) return;
     let disposed = false;
     let timer;
     const poll = async () => {
       try {
+        if (latestRef.current.submission?.personalProductIds?.length || latestRef.current.submission?.payload?.items?.some(item => item.productId.startsWith('self_'))) requireCustomerToken();
         let result;
         try {
-          result = await api(`${base}/submissions/${encodeURIComponent(submission.submissionId)}`);
+          result = await orderApi(`${base}/submissions/${encodeURIComponent(submission.submissionId)}`);
         } catch (error) {
           if (error.code !== 'SUBMISSION_NOT_FOUND' || !latestRef.current.submission?.payload) throw error;
           // A disconnected first request may never have reached the service. Replay
           // the persisted payload and original ID; the service owns deduplication.
-          result = await api(`${base}/orders`, { method: 'POST', body: JSON.stringify(latestRef.current.submission.payload) });
+          if (latestRef.current.submission.personalProductIds?.length || latestRef.current.submission.payload.items?.some(item => item.productId.startsWith('self_'))) requireCustomerToken();
+          result = await orderApi(`${base}/orders`, { method: 'POST', body: JSON.stringify(latestRef.current.submission.payload) });
         }
         if (disposed) return;
         acceptSubmission(result);
         if (result.status !== 'failed') setSubmitError('');
-        if (result.status === 'failed' && result.error?.code === 'PRODUCT_CHANGED') await loadCatalog({ silent: true }).catch(() => {});
+        if (result.status === 'failed' && changedProduct(result.error || {})) await refreshProducts();
         if (activeStatuses.has(result.status)) timer = setTimeout(poll, 2000);
       } catch (error) {
         if (disposed) return;
+        if (error.code === 'CUSTOMER_STORAGE_UNAVAILABLE') { setSubmitError(error.message); return; }
+        if (customerTokenError(error)) { holdSubmissionForReview(error); return; }
         if (error.code === 'SUBMISSION_CONFLICT') {
           holdSubmissionForReview(error);
           return;
@@ -219,8 +434,8 @@ export default function App() {
         if (isDefiniteRejection(error)) {
           setSubmission(null);
           removeStored(pendingKey);
-          setSubmitError(error.code === 'PRODUCT_CHANGED' ? '商品信息发生了变化，已更新购物车。请核对当前价格和规格后再次提交。' : error.message);
-          await loadCatalog({ silent: true }).catch(() => {});
+          setSubmitError(changedProduct(error) ? '商品信息发生了变化，正在更新购物车。请核对当前价格和规格后再次提交。' : error.message);
+          await refreshProducts();
           return;
         }
         setSubmitError(error.httpStatus === 429 ? '请求有些频繁，稍后会继续确认同一次提交，请勿重复下单。' : '正在确认保存结果，请保留此页面。网络恢复后会继续检查。');
@@ -229,22 +444,31 @@ export default function App() {
     };
     poll();
     return () => { disposed = true; clearTimeout(timer); };
-  }, [submission?.submissionId, submission?.status, submission?.requiresReview, code]);
+  }, [submission?.submissionId, submission?.status, submission?.requiresReview, submitBusy, code, identity.token, identity.error]);
 
   function updateQuantity(id, quantity) {
     if (working || !collecting) return;
-    setCart(current => {
-      const next = { ...current };
-      if (quantity > 0) next[id] = Math.min(99, quantity);
-      else delete next[id];
-      return next;
-    });
+    const product = productMap.get(id);
+    if (quantity > 0 && (!purchasable(product) || product.quoteExpired && quantity > (latestRef.current.cart[id] || 0) || product.selfSelected && (customerState !== 'ready' || identity.error))) return;
+    const next = { ...latestRef.current.cart };
+    if (quantity > 0) next[id] = Math.min(99, quantity);
+    else delete next[id];
+    if (product?.selfSelected || id.startsWith('self_')) {
+      try { persistPersonalCart(next); }
+      catch (error) { setCustomerError(error.message); return; }
+    }
+    latestRef.current.cart = next; setCart(next);
     if (submission?.status === 'completed') setSubmission(null);
   }
 
   function removeItem(id) {
     if (working) return;
-    setCart(current => { const next = { ...current }; delete next[id]; return next; });
+    const next = { ...latestRef.current.cart }; delete next[id];
+    if (productMap.get(id)?.selfSelected || id.startsWith('self_') || !catalogProductMap.has(id)) {
+      try { persistPersonalCart(next, false); }
+      catch (error) { setCustomerError(error.message); return; }
+    }
+    latestRef.current.cart = next; setCart(next);
   }
 
   async function submitOrder(event) {
@@ -258,41 +482,60 @@ export default function App() {
     const nextErrors = {};
     if (!draft.name.trim()) nextErrors.name = '请填写姓名或群昵称。';
     if (!/^1[3-9]\d{9}$/.test(phone)) nextErrors.phone = '请填写有效的 11 位手机号码。';
-    if (hasUnavailable) nextErrors.items = '部分商品已停售或移除，请先从购物车移除。';
+    if (personalUnresolved) nextErrors.items = '个人清单尚未恢复，请先点击“恢复个人清单”再提交。';
+    else if (hasUnavailable) nextErrors.items = '部分商品暂不可购买，请核对并从购物车移除。';
     setErrors(nextErrors);
     if (Object.keys(nextErrors).length) {
       const field = nextErrors.name ? 'name' : nextErrors.phone ? 'phone' : null;
       formRef.current?.elements[field]?.focus();
       return;
     }
-    const payloadBody = { phone, name: draft.name.trim(), note: draft.note.trim(), items: items.map(item => ({ productId: item.id, quantity: item.quantity, version: item.product.version })).sort((a, b) => a.productId.localeCompare(b.productId)) };
+    if (hasPersonalItems) {
+      try { requireCustomerToken(); }
+      catch (error) { setSubmitError(error.message); return; }
+    }
+    if (!quoteReady || JSON.stringify({ ...quoteInput, phone }) !== cartQuote?.key) {
+      setSubmitError('正在核对商品和代购费，请待金额显示后再次提交。');
+      setQuoteRefresh(value => value + 1); return;
+    }
+    const payloadBody = { phone, name: draft.name.trim(), note: draft.note.trim(), feePolicyVersion: catalog.batch.feePolicyVersion, feeQuoteVersion: confirmedQuote.feeQuoteVersion, items: quoteInput.items };
     // Only a confirmed terminal failure can create a new submission. A pending
     // submission is recovered by the poller using its original persisted ID.
     let submissionId;
     try { submissionId = createSubmissionId(); }
     catch { setSubmitError('当前浏览器无法下单，请使用 Safari 或 Chrome 打开本期链接。'); return; }
     const payload = { submissionId, ...payloadBody };
-    const pending = { submissionId: payload.submissionId, status: 'pending', payload };
+    const pending = { submissionId: payload.submissionId, status: 'pending', payload, personalProductIds: items.filter(item => item.product.selfSelected || !catalogProductMap.has(item.id)).map(item => item.id) };
+    if (hasPersonalItems) {
+      try {
+        const value = JSON.stringify(pending);
+        localStorage.setItem(pendingKey, value);
+        if (localStorage.getItem(pendingKey) !== value) throw new Error('Pending storage unavailable');
+      } catch { setSubmitError('本次提交暂时无法保存，请允许浏览器保存本站数据后再下单。'); return; }
+    }
     setSubmitBusy(true);
     setSubmitError('');
     setSubmission(pending);
     saveStored(pendingKey, pending);
     try {
-      const result = await api(`${base}/orders`, { method: 'POST', body: JSON.stringify(payload) });
+      const result = await orderApi(`${base}/orders`, { method: 'POST', body: JSON.stringify(payload) });
       acceptSubmission(result, payload);
     } catch (error) {
-      if (error.code === 'PRODUCT_CHANGED') {
+      if (customerTokenError(error)) {
+        holdSubmissionForReview(error, payload);
+      } else if (changedProduct(error)) {
         setSubmission(null);
         removeStored(pendingKey);
-        setSubmitError('商品信息发生了变化，已更新购物车。请核对当前价格和规格后再次提交。');
-        await loadCatalog({ silent: true }).catch(() => {});
+        setSubmitError(error.code === 'FEE_POLICY_CHANGED' ? '本期收费规则已更新，请核对新的费用后再次提交。' : error.code === 'FEE_QUOTE_CHANGED' ? '本期订单已调整，请核对新的费用后再次提交。' : '商品信息发生了变化，正在更新购物车。请核对当前价格和规格后再次提交。');
+        setQuoteRefresh(value => value + 1);
+        await refreshProducts();
       } else if (error.code === 'SUBMISSION_CONFLICT') {
         holdSubmissionForReview(error, payload);
       } else if (isDefiniteRejection(error)) {
         setSubmission(null);
         removeStored(pendingKey);
         setSubmitError(error.message);
-        await loadCatalog({ silent: true }).catch(() => {});
+        await refreshProducts();
       } else {
         // The server may have saved the order before the connection failed.
         setSubmitError(error.httpStatus === 429 ? '请求有些频繁，稍后会继续确认同一次提交，请勿重复下单。' : '正在确认提交结果，请勿重新下单。');
@@ -326,28 +569,35 @@ export default function App() {
     </div></header>
     <main className="page-shell">
       {batch?.communityName && <div className="batch-context"><strong>{batch.communityName} · {batch.periodLabel}</strong><span>下单自动归入本小区、本期</span>{batch.pickupLocation && <small>取货地点：{batch.pickupLocation}{batch.pickupAt && ` · ${new Date(batch.pickupAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Shanghai' })}`}</small>}</div>}
+      {batch && <FeePolicyNotice policy={batch.feePolicy} />}
       {catalogState === 'loading' && !catalog ? <div className="loading-panel" role="status"><span className="spinner" />正在准备本期商品…</div> : catalogState === 'ended' ? <EmptyState icon="clock" title="本期收集已结束" description={catalogError || '本期表格已移除，请联系代购获取新一期链接。'} /> : catalogState === 'error' && !catalog ? <EmptyState icon="info" title="暂时无法打开本期商品" description={catalogError}><button className="button primary" onClick={() => loadCatalog().catch(() => {})}>重新加载</button></EmptyState> : <>
         {catalogState === 'error' && <div className="notice error" role="alert"><Icon name="info" /><span>{catalogError} 当前暂时无法下单。</span><button onClick={() => loadCatalog({ silent: true }).catch(() => {})}>重试</button></div>}
+        {(customerError || identity.error) && <div className="notice error customer-recovery-notice" role="alert"><Icon name="info" /><span>{identity.error || customerError} 已有购物车会保留。</span><button type="button" onClick={retryPersonalProducts}>恢复个人清单</button></div>}
+        {hasPersonalItems && customerState === 'loading' && <div className="notice" role="status"><span className="spinner" /><span>正在恢复你的自选清单，购物车数量会保留。</span></div>}
         {view === 'products' && <>
           <section className="hero"><div className="hero-copy"><div className="eyebrow"><span className={`status-dot ${collecting ? '' : 'closed'}`} />{collecting ? '本期正在收集' : '本期已截单'}{cutoffText && <span className="cutoff"><Icon name="clock" size={14} />{cutoffText} 截单</span>}</div><h1>{batch?.title || '把喜欢的，<br />一起带回家。'}</h1><p>{batch?.description || '选好商品，填上手机号，我们按清单帮你采购。'}</p><div className="hero-notes"><span><Icon name="check" size={15} />固定规格，按份选购</span><span><Icon name="check" size={15} />手机号查询本期订单</span></div></div><div className="hero-art" aria-hidden="true"><svg viewBox="0 0 280 225"><circle cx="145" cy="109" r="97" fill="#e5eddb"/><ellipse cx="142" cy="201" rx="97" ry="9" fill="#d7dfce"/><path d="m68 88 145-6-17 114H87Z" fill="#c89357"/><path d="M89 89c0-65 104-71 102-5" fill="none" stroke="#9c733f" strokeWidth="9"/><path d="m93 61 24 8-17 70-24-8Z" fill="#f8e8c7"/><path d="m100 52 19 6-1 18-24-8Z" fill="#348268"/><rect x="145" y="54" width="36" height="86" rx="18" fill="#d29642" transform="rotate(20 163 97)"/><path d="m158 76 14 5m-19 12 14 5m-19 12 14 5" stroke="#bd7c2c" strokeWidth="3"/><path d="M181 105c-9-20-1-33 11-31 0-13 17-20 23-7 17-4 25 12 14 23 15 9 2 28-12 21Z" fill="#477d47"/><path d="m187 145 17-48" stroke="#7eaa62" strokeWidth="9"/><path d="m68 88 145-6-17 114H87Z" fill="#e4b47c"/><path d="M101 148h71" stroke="#bd8b56" strokeWidth="1.5"/><path d="M139 166c-17-7-20-18-11-25 10 1 17 11 11 25Zm0 0c2-21 10-28 20-22 1 11-8 20-20 22Z" fill="#557854"/><path d="M139 166v12" stroke="#557854" strokeWidth="2"/><circle cx="50" cy="62" r="4" fill="#d7a569"/><path d="m231 42 5 4m-5 0 5-4" stroke="#729364" strokeWidth="2"/><circle cx="232" cy="156" r="5" fill="#abc69d"/></svg><span>好物一起买 · 生活慢慢选</span></div></section>
           {!collecting && <div className="notice"><Icon name="info" /><span>本期已停止收集，你仍可以查看商品和查询自己的订单。</span></div>}
-          <section className="catalog-section" aria-label="商品列表"><div className="section-heading"><div><span className="overline">THIS WEEK’S PICKS</span><h2>本期好物 <span>{products.length} 件商品</span></h2></div><label className="search-field"><Icon name="search" size={19} /><input type="search" aria-label="搜索商品" placeholder="搜索商品名称、规格" ref={searchInputRef} defaultValue={search} onChange={updateSearch} onInput={updateSearch} onCompositionEnd={updateSearch} onBlur={updateSearch} />{search && <button aria-label="清空搜索" type="button" onClick={clearSearch}><Icon name="close" size={15} /></button>}</label></div><div className="category-tabs" aria-label="商品分类">{categories.map(value => <button key={value} aria-pressed={category === value} className={category === value ? 'selected' : ''} onClick={() => setCategory(value)}>{value}</button>)}</div>
-            {shownProducts.length ? <div className="product-grid">{shownProducts.map(product => <article className={`product-card ${!product.onSale ? 'sold-out' : ''}`} key={product.id}><div className="product-visual"><ProductImage product={product} /><span className="product-category">{product.category}</span>{!product.onSale && <span className="unavailable-label">本期停售</span>}</div><div className="product-details"><p className="product-id">{product.id}</p><h3>{product.name}</h3><p className="product-spec">{product.spec}</p><div className="product-bottom"><div className="price"><span>{money(product.priceCents)}</span><small> / {product.unit}</small></div><Stepper product={product} quantity={cart[product.id] || 0} disabled={!collecting || !product.onSale || working} onChange={quantity => updateQuantity(product.id, quantity)} /></div></div></article>)}</div> : <EmptyState icon="search" title="没有找到这个商品" description="换个关键词，或查看其他分类。"><button className="button secondary" onClick={() => { clearSearch(); setCategory('全部'); }}>查看全部商品</button></EmptyState>}
-          </section>{products.some(product => product.id.startsWith('DEMO-')) && <p className="illustration-note">演示商品及价格仅用于体验 · 图片为商品示意图，非实拍</p>}
+          <section className="catalog-section" aria-label="商品列表"><div className="section-heading"><div><span className="overline">THIS WEEK’S PICKS</span><h2>本期好物 <span>{products.length} 件商品</span></h2></div><label className="search-field"><Icon name="search" size={19} /><input type="search" aria-label="搜索商品" placeholder="搜索商品名称、规格" ref={searchInputRef} defaultValue={search} onChange={updateSearch} onInput={updateSearch} onCompositionEnd={updateSearch} onBlur={updateSearch} />{search && <button aria-label="清空搜索" type="button" onClick={clearSearch}><Icon name="close" size={15} /></button>}</label></div>
+            {shownProducts.length ? <div className="product-grid">{shownProducts.map(product => <CustomerProductCard feePolicy={catalog?.batch.feePolicy} key={product.id} product={product} quantity={cart[product.id] || 0} disabled={!collecting || working} onChange={quantity => updateQuantity(product.id, quantity)} />)}</div> : <EmptyState icon="search" title="本期推荐中没有找到" description="可以换个关键词，也可以搜索山姆商品加入自己的清单。"><div className="customer-empty-actions"><button type="button" className="button secondary" onClick={clearSearch}>查看全部商品</button><button type="button" className="button primary" onClick={() => openSamsSearch()} disabled={!collecting || working}>去山姆搜索{search ? `“${search}”` : '商品'}</button></div></EmptyState>}
+          </section>
+          {!!personalProducts.length && <section className="customer-personal-list" aria-label="我的自选商品"><div className="section-heading"><div><h2>我的自选 <span>{personalProducts.length} 件商品</span></h2><p>只保存在你的清单里，可以和本期推荐一起下单。</p></div></div><div className="product-grid">{personalProducts.map(product => <CustomerProductCard feePolicy={catalog?.batch.feePolicy} key={product.id} product={{ ...product, selfSelected: true }} quantity={cart[product.id] || 0} disabled={!collecting || working || customerState !== 'ready' || Boolean(identity.error)} onChange={quantity => updateQuantity(product.id, quantity)} onRefresh={() => openSamsSearch(product.name)} />)}</div></section>}
+          <div className="customer-sams-entry"><div><h2>没找到想买的？</h2><p>{batch?.samsStore ? '搜索山姆商品，加入自己的购物车，和本期好物一起下单。' : '本期暂未设置山姆采购门店，请联系团长开通自选。'}</p></div><button type="button" className="button secondary" onClick={() => openSamsSearch()} disabled={!collecting || working}>搜索山姆商品<Icon name="search" size={17} /></button></div>
+          {samsSearchOpen && <CustomerSamsSearch base={base} api={customerApi} store={batch?.samsStore} initialKeyword={samsInitialKeyword} disabled={!collecting || working} identityError={identity.error} addingId={customerAdding} onAdd={addCustomerProduct} onClose={() => setSamsSearchOpen(false)} renderProduct={(product, controls) => <CustomerProductCard feePolicy={catalog?.batch.feePolicy} key={controls.key} product={product} quantity={cart[product.id] || 0} disabled={controls.disabled} adding={controls.adding} onChange={quantity => quantity < (cart[product.id] || 0) ? updateQuantity(product.id, quantity) : controls.onAdd()} />} />}
+          {products.some(product => product.id.startsWith('DEMO-')) && <p className="illustration-note">演示商品及价格仅用于体验 · 图片为商品示意图，非实拍</p>}
         </>}
         {view === 'cart' && <section className="cart-page"><div className="page-title"><span className="overline">YOUR SHOPPING BAG</span><h1>把好物装进购物车</h1><p>核对商品和联系方式，准备好就提交。</p></div>
-          {submission?.status === 'completed' ? <div className="success-panel"><span className="success-icon"><Icon name="check" size={36} /></span><h2>下单成功，清单已收好</h2><p>本次商品已追加到你的本期订单。<br />后续修改或取消，请联系代购。</p><div className="success-actions"><button className="button primary" onClick={() => { navigate('query'); }}>查询我的订单<Icon name="arrow" size={16} /></button><button className="button secondary" onClick={() => { setSubmission(null); navigate('products'); }}>继续选购</button></div><small>提交编号：{submission.submissionId}</small></div> : items.length || working ? <div className="checkout-layout"><div className="cart-list"><div className="card-heading"><h2>已选商品 <span>{items.length} 种</span></h2><button className="text-button" disabled={working} onClick={() => navigate('products')}>继续选购<Icon name="arrow" size={14} /></button></div>{items.map(({ product, id, quantity }) => <article className="cart-item" key={id}><ProductImage product={product || { id, name: '商品已移除' }} /><div className="cart-item-info"><h3>{product?.name || `商品 ${id}`}</h3><p>{product?.spec || '商品信息已移除，请联系代购'}{product && ` · ${product.unit}`}</p><div className="cart-item-price">{product ? money(product.priceCents) : '价格待确认'}{(!product || !product.onSale) && <span className="status-chip">已停售，请移除</span>}</div></div><div className="cart-item-controls"><button className="remove-button" type="button" aria-label={`移除${product?.name || id}`} disabled={working} onClick={() => removeItem(id)}><Icon name="close" size={16} /></button>{product && <Stepper product={product} quantity={quantity} disabled={!collecting || working || !product.onSale} onChange={next => updateQuantity(id, next)} />}<strong>{product ? money(product.priceCents * quantity) : '待确认'}</strong></div></article>)}{!items.length && working && <p className="subtle">正在恢复本次提交的确认结果…</p>}<div className="cart-list-footer"><Icon name="info" size={17} /><span>同一手机号再次提交，商品数量会追加到本期订单。</span></div></div><form className="checkout-form" onSubmit={submitOrder} ref={formRef} noValidate><h2>填写下单信息</h2><label htmlFor="name">姓名 / 群昵称 <span>*</span></label><input id="name" name="name" autoComplete="name" maxLength={40} placeholder="方便分货时找到你" disabled={working} defaultValue={form.name} aria-invalid={Boolean(errors.name)} aria-describedby={errors.name ? 'name-error' : undefined} onChange={updateForm} onInput={updateForm} onCompositionEnd={updateForm} onBlur={updateForm} />{errors.name && <p className="field-error" id="name-error">{errors.name}</p>}<label htmlFor="phone">手机号码 <span>*</span></label><input id="phone" name="phone" type="tel" inputMode="tel" autoComplete="tel" placeholder="手机号用于合并和查询订单" maxLength={20} disabled={working} defaultValue={form.phone} aria-invalid={Boolean(errors.phone)} aria-describedby={errors.phone ? 'phone-error' : 'phone-help'} onChange={updateForm} onInput={updateForm} onCompositionEnd={updateForm} onBlur={updateForm} />{errors.phone ? <p className="field-error" id="phone-error">{errors.phone}</p> : <p className="field-help" id="phone-help">请核对手机号，填错会归入其他人的订单。</p>}<label htmlFor="note">备注 <small>选填</small></label><textarea id="note" name="note" rows={3} maxLength={500} placeholder="有需要说明的事，可以写在这里" disabled={working} defaultValue={form.note} onChange={updateForm} onInput={updateForm} onCompositionEnd={updateForm} onBlur={updateForm} /><div className="checkout-total"><span>本次商品金额<small>{itemCount} 件商品</small></span><strong>{money(cartTotal)}</strong></div><p className="field-help">按当前商品价格计算，最终金额由代购确认。</p>{errors.items && <p className="field-error">{errors.items}</p>}{working && <div className="submission-progress" role="status">{submission?.requiresReview ? <Icon name="info" /> : <span className="spinner" />}<div><strong>{submission?.requiresReview ? '请联系代购核对本次提交' : submission?.status === 'reconciling' ? '正在核对保存结果' : '正在保存你的清单'}</strong><small>{submission?.requiresReview ? '提交编号已保留，请勿重复下单。' : '请勿重复提交，刷新页面也会继续确认。'}</small></div></div>}{submitError && <p className={`notice ${working ? '' : 'error'}`} role="alert">{submitError}</p>}<button className="button primary submit-button" type="submit" disabled={!collecting || working || hasUnavailable}>{submission?.requiresReview ? '请联系代购核对' : working ? '正在确认订单…' : !collecting ? '本期已停止收集' : submission?.status === 'failed' ? '重新提交订单' : '确认并追加下单'}{!working && collecting && <Icon name="arrow" size={17} />}</button><p className="checkout-note">本次提交会追加到本期订单。修改或取消请联系代购。</p>{submission?.submissionId && <p className="submission-id">提交编号：{submission.submissionId}</p>}</form></div> : <EmptyState title="购物车还是空的" description="去选几件喜欢的商品，我们帮你一起带回来。"><button className="button primary" onClick={() => navigate('products')}>去选商品<Icon name="arrow" size={16} /></button></EmptyState>}
+          {submission?.status === 'completed' ? <div className="success-panel"><span className="success-icon"><Icon name="check" size={36} /></span><h2>下单成功，清单已收好</h2><p>本次商品已追加到你的本期订单。<br />后续修改或取消，请联系代购。</p><div className="success-actions"><button className="button primary" onClick={() => { navigate('query'); }}>查询我的订单<Icon name="arrow" size={16} /></button><button className="button secondary" onClick={() => { setSubmission(null); navigate('products'); }}>继续选购</button></div><small>提交编号：{submission.submissionId}</small></div> : items.length || working ? <div className="checkout-layout"><div className="cart-list"><div className="card-heading"><h2>已选商品 <span>{items.length} 种</span></h2><button className="text-button" disabled={working} onClick={() => navigate('products')}>继续选购<Icon name="arrow" size={14} /></button></div>{items.map(({ product, id, quantity }) => <article className="cart-item" key={id}><ProductImage product={product || { id, name: '商品已移除' }} /><div className="cart-item-info"><h3>{product?.name || '商品信息待恢复'}{(product?.selfSelected || !catalogProductMap.has(id)) && <span className="self-selected-text">自选</span>}</h3><p>{product ? productDescription(product) : '商品信息暂时无法恢复，请重试个人清单'}{product?.unit && ` · ${product.unit}`}</p><div className="cart-item-price">{knownPrice(product) ? money(product.priceCents) : '价格待确认'}{(!purchasable(product) || product?.quoteExpired) && <span className="status-chip">{personalUnresolved ? '清单待恢复' : product?.quoteExpired ? '报价已过期，提交时重新核对' : '暂不可购买'}</span>}</div></div><div className="cart-item-controls"><button className="remove-button" type="button" aria-label={`移除${product?.name || id}`} disabled={working} onClick={() => removeItem(id)}><Icon name="close" size={16} /></button>{product && <Stepper product={product} quantity={quantity} disabled={!collecting || working || !purchasable(product) || personalUnresolved} increaseDisabled={product.quoteExpired} onChange={next => updateQuantity(id, next)} />}<strong>{knownPrice(product) ? money(product.priceCents * quantity) : '待确认'}</strong></div></article>)}{!items.length && working && <p className="subtle">正在恢复本次提交的确认结果…</p>}<div className="cart-list-footer"><Icon name="info" size={17} /><span>同一手机号再次提交，商品数量会追加到本期订单。</span></div></div><form className="checkout-form" onSubmit={submitOrder} ref={formRef} noValidate><h2>填写下单信息</h2><label htmlFor="name">姓名 / 群昵称 <span>*</span></label><input id="name" name="name" autoComplete="name" maxLength={40} placeholder="方便分货时找到你" disabled={working} defaultValue={form.name} aria-invalid={Boolean(errors.name)} aria-describedby={errors.name ? 'name-error' : undefined} onChange={updateForm} onInput={updateForm} onCompositionEnd={updateForm} onBlur={updateForm} />{errors.name && <p className="field-error" id="name-error">{errors.name}</p>}<label htmlFor="phone">手机号码 <span>*</span></label><input id="phone" name="phone" type="tel" inputMode="tel" autoComplete="tel" placeholder="手机号用于合并和查询订单" maxLength={20} disabled={working} defaultValue={form.phone} aria-invalid={Boolean(errors.phone)} aria-describedby={errors.phone ? 'phone-error' : 'phone-help'} onChange={updateForm} onInput={updateForm} onCompositionEnd={updateForm} onBlur={updateForm} />{errors.phone ? <p className="field-error" id="phone-error">{errors.phone}</p> : <p className="field-help" id="phone-help">请核对手机号，填错会归入其他人的订单。</p>}<label htmlFor="note">备注 <small>选填</small></label><textarea id="note" name="note" rows={3} maxLength={500} placeholder="有需要说明的事，可以写在这里" disabled={working} defaultValue={form.note} onChange={updateForm} onInput={updateForm} onCompositionEnd={updateForm} onBlur={updateForm} /><OrderFees billing={confirmedQuote} goodsCents={knownCartTotal ? cartTotal : null} goodsLabel={`本次商品金额 · ${itemCount} 件`} totalLabel="本次应付" pending={quoteState === 'loading'} /><p className={`customer-fee-quote-state ${quoteError ? 'error' : ''}`} role={quoteError ? 'alert' : 'status'}>{quoteError || (confirmedQuote?.quoteExpired ? '部分自选报价已过期，提交时会重新核对价格。' : quoteReady ? '费用已核对；缺货和取消部分不收代购费。' : quoteState === 'loading' ? '正在核对商品和代购费…' : '恢复商品信息后即可核对费用。')}</p>{quoteError && <button className="text-button customer-fee-retry" type="button" disabled={working} onClick={async () => { await refreshProducts(); setQuoteRefresh(value => value + 1); }}>重新核对商品和费用</button>}{errors.items && <p className="field-error">{errors.items}</p>}{orderWorking && <div className="submission-progress" role="status">{submission?.requiresReview ? <Icon name="info" /> : <span className="spinner" />}<div><strong>{submission?.requiresReview ? '请联系代购核对本次提交' : submission?.status === 'reconciling' ? '正在核对保存结果' : '正在保存你的清单'}</strong><small>{submission?.requiresReview ? '提交编号已保留，请勿重复下单。' : '请勿重复提交，刷新页面也会继续确认。'}</small></div></div>}{submitError && <p className={`notice ${working ? '' : 'error'}`} role="alert">{submitError}</p>}<button className="button primary submit-button" type="submit" disabled={!collecting || working || hasUnavailable || personalUnresolved || !quoteReady}>{submission?.requiresReview ? '请联系代购核对' : customerAdding ? '正在加入商品…' : orderWorking ? '正在确认订单…' : !collecting ? '本期已停止收集' : personalUnresolved ? '请先恢复个人清单' : !quoteReady ? '请先核对费用' : submission?.status === 'failed' ? '重新提交订单' : '确认并追加下单'}{!working && collecting && <Icon name="arrow" size={17} />}</button><p className="checkout-note">本次提交会追加到本期订单。修改或取消请联系代购。</p>{submission?.submissionId && <p className="submission-id">提交编号：{submission.submissionId}</p>}</form></div> : <EmptyState title="购物车还是空的" description="去选几件喜欢的商品，我们帮你一起带回来。"><button className="button primary" onClick={() => navigate('products')}>去选商品<Icon name="arrow" size={16} /></button></EmptyState>}
         </section>}
         {view === 'query' && <section className="query-page"><div className="page-title"><span className="overline">YOUR ORDER</span><h1>看看你的本期订单</h1><p>输入下单时的手机号，补单商品会合并显示。</p></div><form className="query-form" onSubmit={queryOrders} ref={queryFormRef} noValidate><label htmlFor="query-phone">下单手机号</label><div className="query-input-row"><div className="phone-input"><Icon name="phone" size={19} /><input id="query-phone" name="query-phone" type="tel" inputMode="tel" autoComplete="tel" maxLength={20} placeholder="请输入 11 位手机号码" ref={queryInputRef} defaultValue={queryPhone} onChange={updateQueryPhone} onInput={updateQueryPhone} onCompositionEnd={updateQueryPhone} onBlur={updateQueryPhone} aria-describedby={queryError ? 'query-error' : 'query-help'} aria-invalid={Boolean(queryError)} /></div><button className="button primary" disabled={queryState === 'loading'}>{queryState === 'loading' ? <><span className="spinner light" />查询中</> : <><Icon name="search" size={17} />查询订单</>}</button></div>{queryError && <p className="field-error" role="alert" id="query-error">{queryError}</p>}<p className="field-help" id="query-help">仅查询本期订单。知道手机号的人也可以查询，请妥善保管收集链接。</p></form>
           {queryState === 'idle' && <div className="query-guide"><span className="empty-icon"><Icon name="list" size={32} /></span><h2>清单、数量、采购进度</h2><p>本期的每一次补单，都在同一份清单里。</p><div><span><Icon name="check" size={15} />商品数量合并</span><span><Icon name="check" size={15} />采购状态随时查看</span></div></div>}
           {queryState === 'loading' && <div className="loading-panel" role="status"><span className="spinner" />正在查找本期订单…</div>}
           {queryState === 'ready' && !queryResult?.hasOrders && (queryResult?.pendingCount > 0 ? <EmptyState icon="clock" title="你的订单仍在确认中" description={`有 ${queryResult.pendingCount} 次提交正在确认保存，完成后会显示商品清单。请勿重复下单。`}><button className="button secondary" onClick={() => queryOrders()}>刷新确认结果</button></EmptyState> : <EmptyState icon="search" title="本期还没有找到你的订单" description="检查手机号是否正确，或先选购商品并提交。"><button className="button secondary" onClick={() => navigate('products')}>去选商品</button></EmptyState>)}
-          {queryState === 'ready' && queryResult?.hasOrders && <div className="order-result"><div className="order-result-heading"><div><span className="order-label">本期订单</span><h2>{queryResult.phone}</h2></div><button className="text-button" onClick={() => queryOrders()}><Icon name="clock" size={15} />刷新状态</button></div>{queryResult.pendingCount > 0 && <div className="notice"><Icon name="clock" /><span>有 {queryResult.pendingCount} 次提交正在确认，确认完成后会合并到下面的清单。</span></div>}<div className="query-products">{queryResult.products.map(product => <article className="query-item" key={product.id}><ProductImage product={product} /><div className="query-item-info"><h3>{product.name}</h3><p>{product.spec}{product.unit ? ` · ${product.unit}` : ''}</p><div className="status-chips">{product.statuses.map(({ status, quantity }) => <span className={`status-chip ${['缺货', '已取消', 'out_of_stock', 'cancelled', 'canceled'].includes(status) ? 'muted-chip' : ''}`} key={status}>{labels[status] || status} {quantity}{product.unit || '份'}</span>)}</div></div><div className="query-item-amount"><strong>{product.missing ? '待确认' : money(product.amountCents)}</strong><small>累计 {product.quantity}{product.unit || '份'}</small>{!product.missing && <small>{money(product.priceCents)} / {product.unit || '份'}</small>}</div></article>)}</div><div className="order-total"><span>本期商品金额<small>缺货和已取消商品不计入金额</small></span><strong>{queryResult.totalCents === null ? '待代购确认' : money(queryResult.totalCents)}</strong></div><div className="order-contact"><Icon name="info" size={18} /><p>{queryResult.contactNote || batch?.contactNote || '需要修改数量、取消商品或确认缺货情况，请联系代购。'}<small>金额按当前商品价格计算，最终金额由代购确认。</small></p></div></div>}
+          {queryState === 'ready' && queryResult?.hasOrders && <div className="order-result"><div className="order-result-heading"><div><span className="order-label">本期订单</span><h2>{queryResult.phone}</h2></div><button className="text-button" onClick={() => queryOrders()}><Icon name="clock" size={15} />刷新状态</button></div>{queryResult.pendingCount > 0 && <div className="notice"><Icon name="clock" /><span>有 {queryResult.pendingCount} 次提交正在确认，确认完成后会合并到下面的清单。</span></div>}<div className="query-products">{queryResult.products.map(product => <article className="query-item" key={product.id}><ProductImage product={product} /><div className="query-item-info"><h3>{product.name}{product.selfSelected && <span className="self-selected-text">自选</span>}</h3><p>{productDescription(product)}{product.unit ? ` · ${product.unit}` : ''}</p><div className="status-chips">{product.statuses.map(({ status, quantity }) => <span className={`status-chip ${['缺货', '已取消', 'out_of_stock', 'cancelled', 'canceled'].includes(status) ? 'muted-chip' : ''}`} key={status}>{labels[status] || status} {quantity}{product.unit || '份'}</span>)}</div></div><div className="query-item-amount"><strong>{product.missing ? '待确认' : money(product.amountCents)}</strong><small>累计 {product.quantity}{product.unit || '份'}</small>{!product.missing && <small>{product.mixedPrices ? '多次报价' : knownPrice(product) ? `${money(product.priceCents)} / ${product.unit || '份'}` : '单价待确认'}</small>}</div></article>)}</div><OrderFees billing={queryResult} goodsLabel="本期商品金额" totalLabel="本期应付合计" /><div className="order-contact"><Icon name="info" size={18} /><p>{queryResult.contactNote || batch?.contactNote || '需要修改数量、取消商品或确认缺货情况，请联系代购。'}<small>缺货和已取消商品不计商品金额及代购费。新订单按确认时的价格和费率计算。</small></p></div></div>}
         </section>}
         <footer className="site-footer"><span><Icon name="leaf" size={16} />一起选好物，日常多一点美好。</span><span>{batch?.contactNote || '修改订单或了解领取安排，请联系代购。'}</span></footer>
       </>}
     </main>
-    {view === 'products' && itemCount > 0 && catalogState !== 'ended' && <div className="sticky-cart"><div><span className="sticky-cart-icon"><Icon name="bag" size={21} /><b>{itemCount}</b></span><div><strong>{money(cartTotal)}</strong><small>{items.length} 种商品 · {itemCount} 件</small></div></div><button className="button primary" onClick={() => navigate('cart')}>去购物车<Icon name="arrow" size={17} /></button></div>}
+    {view === 'products' && itemCount > 0 && catalogState !== 'ended' && <div className="sticky-cart"><div><span className="sticky-cart-icon"><Icon name="bag" size={21} /><b>{itemCount}</b></span><div><strong>{knownCartTotal ? money(cartTotal) : '金额待恢复'}</strong><small>商品金额 · {itemCount} 件 · 代购费结算时展示</small></div></div><button className="button primary" onClick={() => navigate('cart')}>去购物车<Icon name="arrow" size={17} /></button></div>}
     {notification && <div className="toast" role="status">{notification}</div>}
   </>;
 }

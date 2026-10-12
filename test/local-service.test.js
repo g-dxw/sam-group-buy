@@ -170,9 +170,10 @@ test('unchanged sync counts zero updates; explicit and missing products are kept
   assert.equal(store.getProduct('SAM-002').onSale, false);
 });
 
-test('current product changes alter existing amounts and dirty each affected export row', (t) => {
+test('current product changes preserve legacy dynamic amounts and dirty each affected legacy export row', (t) => {
   const { service, store, batch } = fixture(t);
   service.submit(batch, payload(service, batch, [2, 1]));
+  store.db.prepare('UPDATE order_lines SET snapshot_json=NULL WHERE batch_code=?').run(batch.code);
   for (const line of store.listExportLines(batch.code)) store.markExported(batch.code, line.lineId, 1, `remote-${line.recordId}`);
   const snapshot = structuredClone(products);
   snapshot[0].priceCents = 12300;
@@ -401,7 +402,9 @@ test('public catalog and admin sync summaries hide private source and export-att
   assert.equal(catalog.products[0].recordId, undefined);
   assert.equal(catalog.products[0].updatedAt, undefined);
   const overview = service.overview();
-  assert.equal(overview.productSync.counts.total, 3);
+  assert.equal(overview.productSync.counts.total, 2);
+  assert.equal(overview.productSync.mode, 'local');
+  assert.equal(overview.productSync.counts.pending, 2);
   assert.equal(overview.ordersSync[batch.code].lastSyncedAt, timestamp);
   assert.equal(JSON.stringify(overview).includes('private-base'), false);
   assert.equal(JSON.stringify(overview).includes('private-attempt'), false);

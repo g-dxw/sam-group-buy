@@ -1,7 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { LocalStore } from '../server/local-store.js';
-import { markLegacyExportsPending } from '../server/bootstrap-local.js';
+import { markLegacyExportsPending, initializeLocalData } from '../server/bootstrap-local.js';
+
+test('fresh local setup and subsequent startup do not require or read Feishu', async t => {
+  const store = new LocalStore({ path: ':memory:' }); t.after(() => store.close());
+  const repository = new Proxy({}, { get() { throw new Error('must not access Feishu'); } });
+  await initializeLocalData({ store, repository, config: { batches: [] } });
+  assert.equal(store.getMeta('localInitialized'), true);
+  assert.equal(store.listProducts().length, 0);
+  await initializeLocalData({ store, repository, config: { batches: [{ code: 'legacy' }] } });
+  assert.equal(store.listProducts().length, 0);
+});
 
 test('legacy rows need one export of new reporting fields, without resetting later syncs', t => {
   const store = new LocalStore({ path: ':memory:' }); t.after(() => store.close());

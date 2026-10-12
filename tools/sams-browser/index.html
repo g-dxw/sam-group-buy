@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#2454c6" />
+    <title>山姆商品查找 · 独立查询工具</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#search-form">跳到商品查询</a>
+    <div class="page-shell">
+      <header class="site-header">
+        <a class="site-name" href="./" aria-label="商品查找首页">
+          <span class="site-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none"><rect x="4" y="4" width="6" height="6" rx="1.5"/><rect x="14" y="4" width="6" height="6" rx="1.5"/><rect x="4" y="14" width="6" height="6" rx="1.5"/><path d="m14 17 2 2 4-5"/></svg>
+          </span>
+          <span>商品查找</span>
+        </a>
+        <span class="independent-label">山姆中国 · 独立查询工具</span>
+      </header>
+
+      <main>
+        <section class="intro" aria-labelledby="page-title">
+          <p class="eyebrow">看商品，也看门店价格</p>
+          <h1 id="page-title">选好门店，找到想买的。</h1>
+          <p class="intro-text">按关键词查看商品图片与销售价，整理你的购物清单。</p>
+        </section>
+
+        <section class="search-panel" aria-label="查询条件">
+          <form id="search-form">
+            <div class="location-fields">
+              <div class="field city-field">
+                <label for="city-select">城市</label>
+                <select id="city-select" disabled aria-describedby="location-status"><option value="">正在加载城市…</option></select>
+              </div>
+              <div class="field store-field">
+                <label for="store-select">具体门店</label>
+                <select id="store-select" disabled aria-describedby="location-status"><option value="">请先选择城市</option></select>
+              </div>
+            </div>
+            <div class="location-feedback">
+              <p id="location-status" class="helper-text" role="status" aria-live="polite">正在准备门店选择…</p>
+              <button id="retry-cities" class="text-button" type="button" hidden>重新加载城市</button>
+              <button id="retry-stores" class="text-button" type="button" hidden>重新加载门店</button>
+            </div>
+            <div class="keyword-row">
+              <div class="field keyword-field">
+                <label for="keyword-input">想找什么商品？</label>
+                <div class="keyword-input-wrap">
+                  <svg class="search-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
+                  <input id="keyword-input" type="search" value="牛肉卷" maxlength="80" placeholder="例如：牛肉卷、牛奶、瑞士卷" autocomplete="off" required />
+                </div>
+              </div>
+              <button id="search-button" class="primary-button" type="submit" disabled>查询商品<span aria-hidden="true">→</span></button>
+            </div>
+            <div class="quick-searches" aria-label="快捷关键词">
+              <span class="quick-label">快捷查找</span>
+              <button type="button" class="keyword-chip" data-keyword="牛肉卷">牛肉卷</button>
+              <button type="button" class="keyword-chip" data-keyword="牛奶">牛奶</button>
+              <button type="button" class="keyword-chip" data-keyword="鸡蛋">鸡蛋</button>
+              <button type="button" class="keyword-chip" data-keyword="麻薯">麻薯</button>
+              <button type="button" class="keyword-chip" data-keyword="瑞士卷">瑞士卷</button>
+              <button type="button" class="keyword-chip" data-keyword="牛排">牛排</button>
+            </div>
+          </form>
+
+          <details id="manual-details" class="manual-details">
+            <summary>手动选择门店</summary>
+            <p class="helper-text">门店列表暂时不可用时，可填写已确认的具体门店编号。城市编号不能作为门店编号。</p>
+            <form id="manual-form" class="manual-form">
+              <div class="field"><label for="manual-store-id">门店编号</label><input id="manual-store-id" inputmode="numeric" pattern="[0-9]{1,12}" maxlength="12" placeholder="例如 6505" required /></div>
+              <div class="field"><label for="manual-store-type">门店类型</label><select id="manual-store-type"><option value="2">会员门店</option><option value="4">极速达门店</option><option value="256">电商拣货中心</option><option value="8">全球购门店</option></select></div>
+              <button type="submit" class="secondary-button">使用此门店</button>
+            </form>
+          </details>
+        </section>
+
+        <section class="results-section" aria-labelledby="results-title">
+          <div class="results-heading">
+            <div>
+              <div class="section-kicker"><span class="blue-dot" aria-hidden="true"></span><span id="result-store">所选门店的商品</span></div>
+              <h2 id="results-title">找到想买的商品</h2>
+              <p id="result-meta" class="helper-text">先选择城市与门店，再查询关键词。</p>
+            </div>
+            <button id="export-button" class="secondary-button export-button" type="button" disabled>
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M5 15v5h14v-5"/></svg>导出 JSON
+            </button>
+          </div>
+          <div class="results-toolbar">
+            <label class="availability-control"><input id="available-only" type="checkbox" />只看可售商品</label>
+            <label class="sort-control" for="sort-select">排序<select id="sort-select" aria-label="排序"><option value="default">默认顺序</option><option value="price-asc">价格从低到高</option><option value="price-desc">价格从高到低</option></select></label>
+          </div>
+
+          <div id="query-error" class="error-banner" role="alert" hidden><p id="query-error-message"></p><button id="retry-search" class="secondary-button" type="button">重新查询</button></div>
+          <p id="search-status" class="sr-only" role="status" aria-live="polite"></p>
+          <div id="product-grid" class="product-grid" aria-busy="false"></div>
+          <div id="empty-state" class="empty-state">
+            <span class="empty-icon" aria-hidden="true"><svg viewBox="0 0 48 48" fill="none"><path d="M12 16h24l-2 23H14l-2-23Z"/><path d="M18 18v-7a6 6 0 0 1 12 0v7"/></svg></span>
+            <h3 id="empty-title">从一个关键词开始</h3>
+            <p id="empty-description">选定门店后，查询你想买的商品。</p>
+          </div>
+          <div class="load-more-row"><button id="load-more" class="secondary-button load-more-button" type="button" hidden>加载更多商品<span aria-hidden="true">↓</span></button><p id="pagination-note" class="helper-text"></p></div>
+        </section>
+      </main>
+
+      <footer class="site-footer">
+        <p>价格与可售状态以查询时的所选门店为准，下单前请在山姆 App 或小程序中核对。</p>
+        <p>本工具与山姆无隶属关系。结果仅覆盖当前关键词，排序与筛选应用于已加载商品。</p>
+      </footer>
+    </div>
+
+    <template id="product-template">
+      <article class="product-card">
+        <div class="product-image-wrap"><img class="product-image" loading="lazy" decoding="async" /><span class="image-placeholder" hidden>商品图片暂不可用</span><span class="availability-badge"></span></div>
+        <div class="product-content"><h3 class="product-name"></h3><p class="product-description"></p><div class="product-price-row"><span class="price-label"></span><span class="product-price"></span></div><div class="product-footer"><span class="sale-status"></span><span class="product-id"></span></div></div>
+      </article>
+    </template>
+  </body>
+</html>

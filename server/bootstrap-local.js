@@ -15,8 +15,13 @@ export function markLegacyExportsPending(store) {
 
 export async function initializeLocalData({ store, repository, config, dataDir }) {
   if (store.getMeta('localInitialized')) { markLegacyExportsPending(store); return; }
-  const source = config.batches.find(batch => batch.code === config.defaultBatch) || config.batches[0];
-  if (!source) throw new Error('请先接入飞书商品库。');
+  const source = config.batches?.find(batch => batch.code === config.defaultBatch) || config.batches?.[0];
+  // A fresh installation can select and maintain products before Feishu is
+  // configured. Existing legacy configurations still migrate once below.
+  if (!source) {
+    store.transaction(() => { store.setMeta('localInitialized', true); markLegacyExportsPending(store); });
+    return;
+  }
   const journalPath = resolve(dataDir, 'submissions.sqlite');
   try {
     await stat(journalPath);

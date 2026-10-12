@@ -16,7 +16,7 @@ const definitions = [
 ];
 try {
   const source = await loadFeishuSource();
-  if (!source) throw new Error('请先配置飞书商品源和订单导出表。');
+  if (!source) throw new Error('请先配置飞书商品备份表和订单导出表。');
   const current = await lark(['base', '+table-get', '--base-token', source.baseToken, '--table-id', source.orderTableId]);
   const fields = new Map((current.fields || current.table?.fields || []).map(field => [field.name, field]));
   for (const field of definitions) if (fields.has(field.name) && fields.get(field.name).type !== field.type) throw new Error(`${field.name}已存在但类型不匹配；不会转换原字段。`);

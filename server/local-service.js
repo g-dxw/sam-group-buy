@@ -1,10 +1,11 @@
 import { DomainError, normalizePhone, completeGroup } from './order-service.js';
-import { ORDER_STATUSES, productVersion, payloadHash } from './local-store.js';
+import { ORDER_STATUSES, productVersion, payloadHash, samsStoreKey } from './local-store.js';
+import { addCents, billingSummary, feePolicyVersion, feeRate, incrementalBilling, normalizeFeePolicy } from './order-billing.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PRODUCT_ID = /^[\p{L}\p{N}][\p{L}\p{N}_-]{0,127}$/u;
 const EXCLUDED = new Set(['已取消', '缺货']);
-const BATCH_FIELDS = ['title', 'description', 'productIds', 'collecting', 'cutoffAt', 'pickupLocation', 'pickupAt', 'contactNote'];
+const BATCH_FIELDS = ['title', 'description', 'productIds', 'collecting', 'cutoffAt', 'pickupLocation', 'pickupAt', 'contactNote', 'samsStore', 'feePolicy'];
 
 function trimmed(value, maximum, field, required = false) {
   if (value == null && !required) return '';
@@ -20,38 +21,45 @@ function datetime(value, field) {
   return new Date(value).toISOString();
 }
 function receipt(id) { return { submissionId: id, status: 'completed', receipt: { submissionId: id } }; }
-function imageUrl(batch, id) {
+function imageUrl(batch, id, product) {
+  if (product?.imageUrl) return product.imageUrl;
   const template = process.env.IMAGE_URL_TEMPLATE || batch.imageUrlTemplate || '/images/{id}/cover.svg';
   if (!template.includes('{id}') || (!/^https?:\/\//i.test(template)
     && (!template.startsWith('/') || template.startsWith('//')))) return '/images/placeholder.svg';
   return template.replaceAll('{id}', encodeURIComponent(id));
 }
-function productView(product, batch, admin = false) {
+function productView(product, batch, admin = false, backup = {}) {
   return {
     id: product.id, name: product.name, spec: product.spec, unit: product.unit,
+    description: productDescription(product),
     priceCents: product.priceCents, category: product.category, onSale: product.onSale, sort: product.sort,
-    imageUrl: imageUrl(batch, product.id), version: productVersion(product),
-    ...(admin ? { recordId: product.recordId, updatedAt: product.updatedAt } : {}),
+    imageUrl: imageUrl(batch, product.id, product), version: productVersion(product),
+    ...(admin ? { recordId: product.recordId, updatedAt: product.updatedAt, createdAt: product.createdAt,
+      source: product.source, revision: product.revision, ...backup } : {}),
   };
 }
-function sumAmount(items) {
-  return items.some(item => item.amountCents === null) ? null : items.reduce((sum, item) => sum + item.amountCents, 0);
+function productDescription(product) {
+  if (typeof product?.description === 'string' && product.description) return product.description;
+  return typeof product?.source?.description === 'string' ? product.source.description : '';
 }
 function aggregateProducts(lines) {
   const groups = new Map();
   for (const line of lines) {
     if (!groups.has(line.productId)) groups.set(line.productId, {
       id: line.productId, name: line.productName, spec: line.spec, unit: line.unit,
+      description: productDescription(line.product),
       imageUrl: line.imageUrl, priceCents: line.priceCents, quantity: 0, amountCents: 0,
-      statuses: [], ...(line.priceCents === null ? { missing: true } : {}),
+      statuses: [], selfSelected: line.selfSelected, ...(line.priceCents === null ? { missing: true } : {}),
     });
     const product = groups.get(line.productId);
+    if (product.priceCents !== line.priceCents) product.mixedPrices = true;
+    product.selfSelected ||= line.selfSelected;
     product.quantity += line.quantity;
     let status = product.statuses.find(value => value.status === line.status);
     if (!status) { status = { status: line.status, quantity: 0 }; product.statuses.push(status); }
     status.quantity += line.quantity;
     if (line.amountCents === null) product.amountCents = null;
-    else if (product.amountCents !== null) product.amountCents += line.amountCents;
+    else if (product.amountCents !== null) product.amountCents = addCents([product.amountCents, line.amountCents]);
   }
   return [...groups.values()].map(product => ({ ...product, statuses: product.statuses.sort(
     (a, b) => ORDER_STATUSES.indexOf(a.status) - ORDER_STATUSES.indexOf(b.status),
@@ -77,6 +85,8 @@ export class LocalService {
       cutoffAt: batch.cutoffAt, productIds: batch.productIds,
       pickupLocation: batch.pickupLocation, pickupAt: batch.pickupAt, contactNote: batch.contactNote,
       createdAt: batch.createdAt, managed: true, customerUrl: `/b/${batch.code}`,
+      samsStore: batch.samsStore || null,
+      feePolicy: normalizeFeePolicy(batch.feePolicy), feePolicyVersion: feePolicyVersion(batch),
       feishuUrl: this.store.getMeta('exportSource')?.feishuUrl || batch.feishuUrl || null,
     };
   }
@@ -87,7 +97,8 @@ export class LocalService {
     const { code, title, description, collecting, cutoffAt, contactNote,
       communityName, periodNumber, periodLabel, pickupLocation, pickupAt } = safe;
     return { batch: { code, title, description, collecting, cutoffAt, contactNote,
-      communityName, periodNumber, periodLabel, pickupLocation, pickupAt }, products: this.store.listProducts()
+      communityName, periodNumber, periodLabel, pickupLocation, pickupAt, samsStore: safe.samsStore,
+      feePolicy: safe.feePolicy, feePolicyVersion: safe.feePolicyVersion }, products: this.store.listProducts()
       .filter(product => allProducts || selected.has(product.id)).map(product => productView(product, batch)) };
   }
   normalizeOrder(input) {
@@ -106,26 +117,136 @@ export class LocalService {
       seen.add(item.productId);
       return { productId: item.productId, quantity: item.quantity, version: item.version };
     }).sort((a, b) => a.productId.localeCompare(b.productId));
-    return { submissionId: input.submissionId.toLowerCase(), phone, name, note, items };
+    for (const field of ['feePolicyVersion', 'feeQuoteVersion']) {
+      if (input[field] !== undefined && (typeof input[field] !== 'string' || !/^[0-9a-f]{64}$/.test(input[field]))) {
+        throw new DomainError(400, 'INVALID_FEE_POLICY_VERSION', '收费规则或预计费用版本无效，请刷新后重新确认。');
+      }
+    }
+    return { submissionId: input.submissionId.toLowerCase(), phone, name, note, items,
+      ...(input.feePolicyVersion === undefined ? {} : { feePolicyVersion: input.feePolicyVersion }),
+      ...(input.feeQuoteVersion === undefined ? {} : { feeQuoteVersion: input.feeQuoteVersion }) };
   }
-  submit(inputBatch, input) {
+  feeCategoryForProduct(batch, product) {
+    const selected = new Set(batch.productIds);
+    if (selected.has(product.id)) return 'recommended';
+    const spuId = product.spuId || product.source?.spuId;
+    const source = product.source;
+    if (spuId && batch.samsStore && source?.platform === 'samsclub_cn'
+      && source.storeId === batch.samsStore.storeId && source.storeType === batch.samsStore.storeType
+      && this.store.listProducts().some(local => selected.has(local.id) && local.onSale
+        && local.source?.platform === 'samsclub_cn' && local.source.spuId === spuId
+        && local.source.storeId === batch.samsStore.storeId && local.source.storeType === batch.samsStore.storeType)) return 'recommended';
+    return 'selfSelected';
+  }
+  orderHasFees(batch, payload, { customerProducts = new Map(), ownerHash = null } = {}) {
+    return payload.items.some(item => {
+      const product = customerProducts.get(item.productId) || (ownerHash && this.store.getCustomerProduct(batch.code, ownerHash, item.productId)?.product)
+        || this.store.getProduct(item.productId) || { id: item.productId };
+      return feeRate(batch, this.feeCategoryForProduct(batch, product)) > 0;
+    });
+  }
+  requireFeeQuote(batch, payload, options = {}) {
+    if (this.orderHasFees(batch, payload, options) && !payload.feeQuoteVersion) {
+      throw new DomainError(409, 'FEE_QUOTE_CHANGED', '请先核对本次代购费用，再确认提交。');
+    }
+  }
+  validateFeePolicy(batch, payload, options = {}) {
+    const version = feePolicyVersion(batch);
+    const charged = this.orderHasFees(batch, payload, options);
+    if ((payload.feePolicyVersion !== undefined && payload.feePolicyVersion !== version) || (charged && !payload.feePolicyVersion)) {
+      throw new DomainError(409, 'FEE_POLICY_CHANGED', '本期代购比例或推荐商品已变化，请核对费用后重新确认。', { catalog: this.getCatalog(batch) });
+    }
+    return version;
+  }
+  prepareOrder(batch, payload, { customerProducts = new Map(), ownerHash = null, quote = false } = {}) {
+    const catalog = this.getCatalog(batch);
+    if (!catalog.batch.collecting) throw new DomainError(409, 'COLLECTION_CLOSED', '本期已停止收集，仍可查询已提交订单。');
+    this.validateFeePolicy(batch, payload, { customerProducts, ownerHash });
+    const products = new Map(catalog.products.map(product => [product.id, product]));
+    const personalIds = payload.items.filter(item => !products.has(item.productId) && customerProducts.has(item.productId)).map(item => item.productId);
+    for (const id of personalIds) {
+      const prepared = customerProducts.get(id);
+      const saved = ownerHash && this.store.getCustomerProduct(batch.code, ownerHash, id);
+      if (!prepared?.selectable || !saved || saved.storeKey !== samsStoreKey(batch.samsStore)
+        || saved.product.version !== prepared.version || (!quote && Date.parse(saved.product.expiresAt) <= this.now().getTime())) {
+        throw new DomainError(409, 'SELF_PRODUCT_CHANGED', '个人商品报价已失效，请刷新清单后重新确认。', { productIds: [id] });
+      }
+      const local = prepared.reusedProductId ? this.store.getProduct(prepared.reusedProductId) : null;
+      const matches = this.store.listProducts().filter(product => product.source?.platform === 'samsclub_cn'
+        && product.source.spuId === prepared.spuId && product.source.storeId === batch.samsStore.storeId
+        && product.source.storeType === batch.samsStore.storeType);
+      if (matches.some(product => !product.onSale && !(product.source.customerSelected === true && product.revision === 1))
+        || !prepared.reusedProductId && matches.some(product => product.onSale)) {
+        throw new DomainError(409, 'SELF_PRODUCT_CHANGED', '团长已调整商品在售状态或售价，请重新确认。', { productIds: [id] });
+      }
+      if (prepared.reusedProductId && (!local?.onSale || productVersion(local) !== prepared.localVersion)) {
+        throw new DomainError(409, 'SELF_PRODUCT_CHANGED', '商品售价或在售状态已变化，请重新确认。', { productIds: [id] });
+      }
+      products.set(id, prepared);
+    }
+    const changed = payload.items.filter(item => !products.get(item.productId)?.onSale || products.get(item.productId)?.version !== item.version);
+    if (changed.length) throw new DomainError(409, 'PRODUCT_CHANGED', '商品价格、规格或在售状态已变化，请重新确认。', {
+      productIds: changed.map(item => item.productId), catalog,
+    });
+    return { products, personalIds };
+  }
+  snapshotProduct(batch, product, personal) {
+    const original = personal ? product : this.store.getProduct(product.id);
+    const feeCategory = this.feeCategoryForProduct(batch, original);
+    return { id: product.id, name: product.name, spec: product.spec, unit: product.unit,
+      priceCents: product.priceCents, category: product.category, imageUrl: product.imageUrl,
+      description: productDescription(original), source: original.source, onSale: true,
+      selfSelected: personal, feeCategory, feeRateBps: feeRate(batch, feeCategory), quotedAt: product.quotedAt };
+  }
+  quote(inputBatch, input, options = {}) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)
+      || Object.keys(input).some(key => !['items', 'phone', 'feePolicyVersion'].includes(key))) {
+      throw new DomainError(400, 'INVALID_QUOTE', '预计金额请求无效。');
+    }
+    const phone = input.phone == null || input.phone === '' ? '' : normalizePhone(input.phone);
+    const payload = this.normalizeOrder({ ...input, phone: phone || '13800138000', submissionId: '00000000-0000-4000-8000-000000000000', name: '报价' });
+    const batch = this.getBatch(inputBatch);
+    const { products, personalIds } = this.prepareOrder(batch, payload, { ...options, quote: true });
+    const additions = payload.items.map(item => ({ ...item, lineId: `quote:${item.productId}`, batchCode: batch.code, phone,
+      amountCents: addCents([products.get(item.productId).priceCents * item.quantity]),
+      snapshot: this.snapshotProduct(batch, products.get(item.productId), personalIds.includes(item.productId)) }));
+    const existing = phone ? this.completedLines(this.enrichedLines(batch).filter(line => line.phone === phone)).complete : [];
+    const quoteVersion = payloadHash([batch.code, phone, feePolicyVersion(batch),
+      additions.map(line => [line.productId, line.version, line.quantity, line.amountCents, line.snapshot.feeCategory, line.snapshot.feeRateBps]),
+      existing.map(line => [line.lineId, line.quantity, line.status, line.amountCents, line.feeCategory, line.feeRateBps])
+        .sort((a, b) => a[0].localeCompare(b[0]))]);
+    return { ...incrementalBilling(existing, additions), feePolicyVersion: feePolicyVersion(batch), feeQuoteVersion: quoteVersion,
+      quoteExpired: personalIds.some(id => Date.parse(products.get(id).expiresAt) <= this.now().getTime()) };
+  }
+  submit(inputBatch, input, { customerProducts = new Map(), ownerHash = null } = {}) {
     const payload = this.normalizeOrder(input);
     const hash = payloadHash(payload);
     return this.store.transaction(() => {
       const batch = this.getBatch(inputBatch);
       const existing = this.store.getSubmission(batch.code, payload.submissionId);
       if (existing) {
-        if (existing.payloadHash !== hash) throw new DomainError(409, 'SUBMISSION_CONFLICT', '此提交编号已用于另一份订单，请重新确认后提交。');
+        if (existing.customerHash && existing.customerHash !== ownerHash) throw new DomainError(403, 'CUSTOMER_TOKEN_MISMATCH', '请在原下单浏览器核对这次提交。');
+        const withoutFeeVersion = value => { const { feePolicyVersion: ignored, feeQuoteVersion: ignoredQuote, ...business } = value; return business; };
+        if (existing.payload ? payloadHash(withoutFeeVersion(existing.payload)) !== payloadHash(withoutFeeVersion(payload)) : existing.payloadHash !== hash) {
+          throw new DomainError(409, 'SUBMISSION_CONFLICT', '此提交编号已用于另一份订单，请重新确认后提交。');
+        }
         return receipt(payload.submissionId);
       }
-      const catalog = this.getCatalog(batch);
-      if (!catalog.batch.collecting) throw new DomainError(409, 'COLLECTION_CLOSED', '本期已停止收集，仍可查询已提交订单。');
-      const products = new Map(catalog.products.map(product => [product.id, product]));
-      const changed = payload.items.filter(item => !products.get(item.productId)?.onSale || products.get(item.productId)?.version !== item.version);
-      if (changed.length) throw new DomainError(409, 'PRODUCT_CHANGED', '商品价格、规格或在售状态已变化，请重新确认。', {
-        productIds: changed.map(item => item.productId), catalog,
+      const { products, personalIds } = this.prepareOrder(batch, payload, { customerProducts, ownerHash });
+      this.requireFeeQuote(batch, payload, { customerProducts, ownerHash });
+      if (payload.feeQuoteVersion) {
+        const expected = this.quote(batch, { items: payload.items, phone: payload.phone,
+          ...(payload.feePolicyVersion ? { feePolicyVersion: payload.feePolicyVersion } : {}) }, { customerProducts, ownerHash });
+        if (expected.feeQuoteVersion !== payload.feeQuoteVersion) throw new DomainError(409, 'FEE_QUOTE_CHANGED', '本期订单或预计费用已变化，请重新核对金额后提交。');
+      }
+      const submittedAt = this.now().toISOString();
+      const lines = payload.items.map(item => {
+        const personal = personalIds.includes(item.productId);
+        const product = products.get(item.productId);
+        if (personal && !this.store.getProduct(product.id)) this.store.addCustomerCatalogProduct(product, submittedAt);
+        return { ...item, snapshot: this.snapshotProduct(batch, product, personal) };
       });
-      this.store.saveSubmission(batch.code, payload, { hash, submittedAt: this.now().toISOString() });
+      this.store.saveSubmission(batch.code, payload, { hash, submittedAt, lines, customerHash: personalIds.length ? ownerHash : null });
       return receipt(payload.submissionId);
     });
   }
@@ -137,7 +258,7 @@ export class LocalService {
     return receipt(submission.submissionId);
   }
   enrichedLines(batch) {
-    return this.store.listExportLines(batch.code).map(line => ({ ...line, imageUrl: imageUrl(batch, line.productId) }));
+    return this.store.listExportLines(batch.code).map(line => ({ ...line, imageUrl: imageUrl(batch, line.productId, line.product) }));
   }
   completedLines(lines) {
     const groups = new Map();
@@ -154,21 +275,24 @@ export class LocalService {
     const phone = normalizePhone(inputPhone);
     const result = this.completedLines(this.enrichedLines(batch).filter(line => line.phone === phone));
     const products = aggregateProducts(result.complete);
-    return { phone, products, totalCents: sumAmount(products), pendingCount: result.pending,
+    return { phone, products, ...billingSummary(result.complete), pendingCount: result.pending,
       hasOrders: products.length > 0, contactNote: batch.contactNote };
   }
   overview() {
     const source = this.store.getMeta('exportSource');
     const batches = this.store.listBatches();
-    const imported = this.store.getMeta('productSync');
-    const productMeta = this.store.getMeta('feishu-products') || imported;
-    const counts = productMeta?.counts || (imported ? { total: imported.total,
-      added: imported.added, updated: imported.updated, offSale: imported.offSale } : null);
+    const products = this.store.listProducts();
+    const backup = this.productBackup();
+    const backedUp = products.filter(product => this.productBackupStatus(product, backup).backupStatus === 'backed_up').length;
+    const counts = { total: products.length, onSale: products.filter(product => product.onSale).length,
+      offSale: products.filter(product => !product.onSale).length, backedUp, pending: products.length - backedUp };
     const productSync = {
-      lastSyncedAt: productMeta?.lastSyncedAt || null,
-      status: productMeta?.status === 'error' ? 'failed' : productMeta?.status || (imported ? 'success' : 'never'),
-      counts, error: productMeta?.error || null,
-      result: counts ? { ...counts, created: counts.added } : null,
+      mode: 'local', lastSyncedAt: backup.meta?.lastSyncedAt || null,
+      status: backup.meta?.status || 'never', counts, pending: counts.pending,
+      error: backup.meta?.error || null, result: { ...counts },
+      backup: { configured: backup.configured, status: backup.meta?.status || 'never',
+        lastSyncedAt: backup.meta?.lastSyncedAt || null, counts: backup.meta?.counts || null,
+        error: backup.meta?.error || null, pending: counts.pending },
     };
     const ordersSync = Object.fromEntries(batches.map(batch => {
       const meta = this.store.getMeta(`feishu-export:${batch.code}`);
@@ -180,7 +304,7 @@ export class LocalService {
     }));
     return {
       defaultBatch: this.store.getMeta('defaultBatch'), feishuUrl: source?.feishuUrl || batches[0]?.feishuUrl || null,
-      productCount: this.store.listProducts().length, communities: this.store.listCommunities(),
+      productCount: products.length, communities: this.store.listCommunities(),
       batches: batches.map(batch => this.safeBatch(batch)),
       productSync, ordersSync, lastProductSyncAt: productSync.lastSyncedAt,
       dirtyCount: batches.reduce((sum, batch) => sum + this.store.listExportLines(batch.code, { onlyDirty: true }).length, 0),
@@ -188,13 +312,43 @@ export class LocalService {
   }
   listProducts() {
     const batch = this.store.listBatches()[0] || { imageUrlTemplate: '/images/{id}/cover.svg' };
-    return { products: this.store.listProducts().map(product => productView(product, batch, true)) };
+    const backup = this.productBackup();
+    return { products: this.store.listProducts().map(product => productView(product, batch, true,
+      this.productBackupStatus(product, backup))) };
+  }
+  productBackup() {
+    const source = this.store.getMeta('exportSource');
+    const configured = Boolean(source?.baseToken && source.productTableId);
+    const destination = configured ? `${source.baseToken}:${source.productTableId}` : null;
+    const stored = this.store.getMeta('feishu-product-backup');
+    return { configured, meta: destination && stored?.destination === destination ? stored : null };
+  }
+  productBackupStatus(product, backup = this.productBackup()) {
+    const record = backup.meta?.records?.[product.id];
+    return { backupStatus: record?.revision === product.revision && !record.pendingCreate ? 'backed_up' : 'pending',
+      lastBackedUpAt: record?.lastBackedUpAt || null };
+  }
+  adminProductView(product) {
+    const batch = this.store.listBatches()[0] || { imageUrlTemplate: '/images/{id}/cover.svg' };
+    return productView(product, batch, true, this.productBackupStatus(product));
+  }
+  selectProducts(products) {
+    const result = this.store.selectProducts(products, { timestamp: this.now().toISOString() });
+    return { ...result, products: result.products.map(product => this.adminProductView(product)) };
+  }
+  updateProduct(id, input) {
+    return { product: this.adminProductView(this.store.updateProduct(id, input, { timestamp: this.now().toISOString() })) };
+  }
+  updateProductStatus(input) {
+    const result = this.store.updateProductStatus(input, { timestamp: this.now().toISOString() });
+    return { ...result, products: result.products.map(product => this.adminProductView(product)) };
   }
   createCommunity(input) {
     return { community: this.store.createCommunity({ name: input?.name, createdAt: this.now().toISOString() }) };
   }
   normalizeBatchFields(input, partial = false) {
     const output = {};
+    if (!partial || Object.hasOwn(input, 'feePolicy')) output.feePolicy = normalizeFeePolicy(input.feePolicy);
     const strings = { title: [120, '标题'], description: [1000, '说明'], pickupLocation: [200, '取货地点'], contactNote: [500, '联系说明'] };
     for (const [key, [limit, label]] of Object.entries(strings)) {
       if (!partial || Object.hasOwn(input, key)) output[key] = trimmed(input[key], limit, label);
@@ -211,6 +365,20 @@ export class LocalService {
         || input.productIds.some(id => typeof id !== 'string' || !PRODUCT_ID.test(id))) throw new DomainError(400, 'INVALID_PRODUCTS', '本期商品编号列表无效或重复。');
       output.productIds = [...input.productIds].sort();
     }
+    if (Object.hasOwn(input, 'samsStore')) {
+      const value = input.samsStore;
+      if (value === null) output.samsStore = null;
+      else {
+        if (!value || typeof value !== 'object' || Array.isArray(value) || !/^\d{6}$/.test(value.cityCode)
+          || typeof value.storeId !== 'string' || !/^\d{1,12}$/.test(value.storeId) || ![2, 4, 8, 256].includes(value.storeType)
+          || typeof value.name !== 'string' || !value.name.trim() || value.name.length > 200
+          || typeof value.cityName !== 'string' || !value.cityName.trim() || value.cityName.length > 100) {
+          throw new DomainError(400, 'INVALID_SAMS_STORE', '请选择有效的本期采购门店。');
+        }
+        output.samsStore = { cityCode: value.cityCode, storeId: value.storeId, storeType: value.storeType,
+          name: value.name.trim(), cityName: value.cityName.trim() };
+      }
+    }
     return output;
   }
   createBatch(input) {
@@ -226,7 +394,10 @@ export class LocalService {
     return this.store.transaction(() => {
       const existing = this.store.getBatchByRequest(requestId);
       if (existing) {
-        if (existing.requestHash !== hash) throw new DomainError(409, 'BATCH_REQUEST_CONFLICT', '该创建编号已用于另一份团购。');
+        const { feePolicy: ignoredFeePolicy, ...legacyFields } = fields;
+        const legacyHash = payloadHash({ communityId, communityName, ...legacyFields });
+        const free = fields.feePolicy.recommendedRateBps === 0 && (fields.feePolicy.selfSelectedRateBps ?? 0) === 0;
+        if (existing.requestHash !== hash && !(free && existing.requestHash === legacyHash)) throw new DomainError(409, 'BATCH_REQUEST_CONFLICT', '该创建编号已用于另一份团购。');
         return { batch: this.safeBatch(existing) };
       }
       const community = communityId ? this.store.getCommunity(communityId) : this.store.createCommunity({ name: communityName, createdAt: this.now().toISOString() });
@@ -235,7 +406,7 @@ export class LocalService {
       const selected = fields.productIds ?? products.filter(product => product.onSale).map(product => product.id);
       if (selected.some(id => !products.some(product => product.id === id))) throw new DomainError(400, 'INVALID_PRODUCTS', '本期选择了商品库中不存在的商品。');
       if (selected.length > 200) throw new DomainError(400, 'TOO_MANY_PRODUCTS', '一期最多选择 200 种商品。');
-      if (!selected.length) throw new DomainError(400, 'NO_PRODUCTS', '商品库没有可售商品，请先从飞书同步商品。');
+      if (!selected.length) throw new DomainError(400, 'NO_PRODUCTS', '商品库没有可售商品，请先从山姆查询选品入库，核对后上架。');
       const source = this.store.getMeta('exportSource');
       const batch = this.store.createBatch({ ...fields, productIds: selected, communityId: community.id,
         requestId, requestHash: hash, createdAt: this.now().toISOString(),
@@ -263,6 +434,8 @@ export class LocalService {
       imageUrl: line.imageUrl, quantity: line.quantity, status: line.status, priceCents: line.priceCents,
       amountCents: line.amountCents, submittedAt: line.submittedAt, note: line.note,
       revision: line.revision, syncedRevision: line.syncedRevision, remoteRecordId: line.remoteRecordId, syncError: line.syncError,
+      selfSelected: line.selfSelected, feeCategory: line.feeCategory, feeRateBps: line.feeRateBps,
+      feeCents: line.feeCents, payableCents: line.payableCents,
     };
   }
   getStats(codes = []) {
@@ -277,11 +450,14 @@ export class LocalService {
       if (!EXCLUDED.has(line.status) && line.quantity > 0) {
         if (!purchase.has(line.productId)) purchase.set(line.productId, {
           id: line.productId, name: line.productName, spec: line.spec, unit: line.unit,
-          priceCents: line.priceCents, imageUrl: line.imageUrl, quantity: 0, amountCents: 0, byBatch: [],
+          description: productDescription(line.product),
+          priceCents: line.priceCents, imageUrl: line.imageUrl, quantity: 0, amountCents: 0, byBatch: [], selfSelected: line.selfSelected,
         });
         const product = purchase.get(line.productId);
+        if (product.priceCents !== line.priceCents) product.mixedPrices = true;
+        product.selfSelected ||= line.selfSelected;
         product.quantity += line.quantity;
-        product.amountCents = product.amountCents === null || line.amountCents === null ? null : product.amountCents + line.amountCents;
+        product.amountCents = addCents([product.amountCents, line.amountCents]);
         let part = product.byBatch.find(value => value.code === line.batchCode);
         if (!part) { part = { code: line.batchCode, communityName: line.communityName, periodLabel: line.periodLabel, quantity: 0 }; product.byBatch.push(part); }
         part.quantity += line.quantity;
@@ -299,9 +475,9 @@ export class LocalService {
       batches: selected.map(batch => this.safeBatch(batch)), products,
       customers: [...customers.values()].map(({ lines, ...customer }) => {
         const items = aggregateProducts(lines);
-        return { ...customer, products: items, totalCents: sumAmount(items) };
+        return { ...customer, products: items, ...billingSummary(lines) };
       }),
-      orders: orders.map(line => this.orderView(line)), totalCents: sumAmount(products),
+      orders: orders.map(line => this.orderView(line)), ...billingSummary(orders),
       pendingSubmissions: complete.reduce((sum, group) => sum + group.pending, 0),
       orderCount: complete.reduce((sum, group) => sum + group.count, 0),
       dirtyCount: all.reduce((sum, group) => sum + group.lines.filter(line => line.revision !== line.syncedRevision).length, 0),

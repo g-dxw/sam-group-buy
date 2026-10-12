@@ -10,6 +10,7 @@ function fixture({ items = [{ productId: 'P1', quantity: 2 }] } = {}) {
   store.importProducts([product('P1'), product('P2')]);
   const community = store.createCommunity({ name: '同步验收群' });
   const batch = store.createBatch({ code: 'sync-test', communityId: community.id, productIds: ['P1', 'P2'] });
+  // This fixture represents imported legacy orders without frozen product/fee snapshots.
   store.saveSubmission(batch.code, { submissionId: 'submission-test', phone: '13800000000', name: '验收用户', note: '无需采购', items }, { submittedAt: '2026-10-12T04:00:00.000Z' });
   return { store, batch };
 }
@@ -57,27 +58,7 @@ function remote() {
 const syncer = (store, api, extra = {}) => new FeishuSync({ store, sourceConfig: source, larkCall: api.larkCall,
   readRecordsCall: api.readRecordsCall, backoffMs: [], createBatchViews: false, ...extra });
 
-test('商品全量读取失败或后段无效时保留旧库，成功缺失SKU仅停售', async () => {
-  const { store } = fixture();
-  let snapshot = [product('P1'), { ...product('P2'), priceCents: NaN }];
-  const sync = syncer(store, remote(), { repository: { async readProducts() { return snapshot; } } });
-  assert.equal((await sync.syncProducts()).status, 'error');
-  assert.equal(store.listProducts().length, 2);
-  assert.equal(store.listProducts().find(row => row.id === 'P2').onSale, true);
-  snapshot = [{ ...product('P1'), priceCents: 1200 }];
-  const result = await sync.syncProducts();
-  assert.equal(result.status, 'success');
-  assert.equal(result.counts.offSale, 1);
-  assert.equal(store.listProducts().length, 2);
-  assert.equal(store.listProducts().find(row => row.id === 'P2').onSale, false);
-  assert.equal(store.listExportLines('sync-test')[0].priceCents, 1200);
-  snapshot = [product('P1'), product('P1')];
-  assert.equal((await sync.syncProducts()).error.code, 'PRODUCTS_INVALID');
-  assert.equal(store.listProducts().find(row => row.id === 'P1').priceCents, 1200);
-  store.close();
-});
-
-test('首次写入后整单确认；重复同步无重复追加；取消和改价使用本地当前版本', async () => {
+test('旧无快照订单首次写入后整单确认；重复无追加，取消和改价使用本地当前版本', async () => {
   const { store, batch } = fixture(); const api = remote(); const sync = syncer(store, api);
   assert.equal((await sync.syncOrders(batch.code)).status, 'success');
   assert.equal(api.rows.length, 1);
