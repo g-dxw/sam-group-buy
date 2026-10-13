@@ -111,7 +111,7 @@ export default function GroupBuyHome() {
   const ongoing = useMemo(() => batches.filter(batch => !Number.isFinite(timestamp(batch.cutoffAt)) || timestamp(batch.cutoffAt) > now), [batches, now]);
 
   return <div className="group-buy-home">
-    <header className="site-header"><div className="header-inner"><div className="brand"><span className="brand-mark"><HomeIcon name="bag" size={22} /></span><span>一起逛山姆<small>选择团购 · 一起选购</small></span></div><span className="group-buy-header-note"><HomeIcon name="leaf" size={17} />和邻居一起选好物</span></div></header>
+    <header className="site-header"><div className="header-inner"><div className="brand"><img className="brand-mark" src="/images/sams-club-logo.png" alt="山姆会员商店 Logo" width="52" height="52" /><span>一起逛山姆<small>选择团购 · 一起选购</small></span></div><span className="group-buy-header-note"><HomeIcon name="leaf" size={17} />和邻居一起选好物</span></div></header>
     <main className="group-buy-home-shell">
       <section className="group-buy-home-intro"><span className="group-buy-home-eyebrow"><HomeIcon name="leaf" size={17} />好物一起买</span><h1>进行中的团购</h1><p>选择你所在的群和期次，进入后查看商品并下单。</p>{state === 'ready' && ongoing.length > 0 && <span className="group-buy-home-count" aria-live="polite">{ongoing.length} 期正在收集</span>}</section>
       {state === 'loading' && <div className="group-buy-home-state" role="status"><span className="spinner" />正在查看进行中的团购…</div>}

@@ -23,7 +23,7 @@
 }
 
 .product-image-viewer-dialog::backdrop {
-  background: #10231dcc;
+  background: #20364acc;
 }
 
 .product-image-viewer-panel {
@@ -61,21 +61,21 @@
   padding: 8px;
   border: 1px solid var(--border);
   border-radius: 10px;
-  background: #f5f8f3;
-  color: var(--green-dark);
+  background: var(--primary-soft);
+  color: var(--primary-dark);
   cursor: pointer;
 }
 
 .product-image-viewer-close:hover {
-  background: #e8f1e8;
+  background: var(--primary-hover);
 }
 
 .product-image-viewer-close:active {
-  background: #dceadc;
+  background: #d5e9f6;
 }
 
 .product-image-viewer-close:focus-visible {
-  outline: 3px solid #8fbba2;
+  outline: 3px solid var(--focus);
   outline-offset: 3px;
 }
 

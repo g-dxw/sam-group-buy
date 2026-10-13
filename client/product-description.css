@@ -19,7 +19,7 @@
   padding: 4px 0;
   border: 0;
   background: transparent;
-  color: var(--admin-green, var(--green, #1b6d4e));
+  color: var(--admin-primary, var(--primary, #003a81));
   font: inherit;
   font-size: 12px;
   cursor: pointer;

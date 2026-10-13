@@ -1,18 +1,18 @@
-.customer-split-info { margin: 14px 0; padding: 12px 14px; border-radius: 12px; background: #edf4ee; color: #426654; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.customer-split-info { margin: 14px 0; padding: 12px 14px; border-radius: 12px; background: var(--primary-soft); color: var(--muted); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
 .customer-split-info > div { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; }
-.customer-split-info strong { color: #1b6c4c; }
+.customer-split-info strong { color: var(--primary); }
 .customer-split-info p { margin: 5px 0 0; font-weight: 600; }
 .customer-split-info small { display: block; margin-top: 4px; font-size: 12px; }
 .customer-split-info.compact { margin: 7px 0; padding: 8px 10px; }
-.customer-split-cart-notice { margin: 16px 0; padding: 14px; border: 1px solid #d7e5d9; border-radius: 12px; background: #f4f8f3; font-size: 13px; line-height: 1.7; }
-.customer-split-cart-notice strong { color: #215a42; }
+.customer-split-cart-notice { margin: 16px 0; padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--primary-soft); font-size: 13px; line-height: 1.7; }
+.customer-split-cart-notice strong { color: var(--primary-dark); }
 .customer-split-cart-notice p { margin: 6px 0; }
-.customer-split-cart-notice small { font-size: 12px; color: #66766b; }
-.customer-split-order-info { margin-top: 8px; color: #48755b; font-size: 12px; line-height: 1.6; }
+.customer-split-cart-notice small { font-size: 12px; color: var(--muted); }
+.customer-split-order-info { margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .customer-split-order-info .status-chips { margin-top: 6px; }
 .split-pending-chip { background: #faf1db; color: #846720; }
-.customer-pending-split-bill { padding: 18px 24px; border-top: 1px solid #e2e8df; background: #f7f8ee; font-size: 13px; line-height: 1.7; }
+.customer-pending-split-bill { padding: 18px 24px; border-top: 1px solid var(--border); background: #fff8e8; font-size: 13px; line-height: 1.7; }
 .customer-pending-split-bill > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; }
-.customer-pending-split-bill strong { color: #687127; }
-.customer-pending-split-bill p { margin: 8px 0 0; color: #677468; }
+.customer-pending-split-bill strong { color: #846720; }
+.customer-pending-split-bill p { margin: 8px 0 0; color: var(--muted); }
 @media (max-width: 600px) { .customer-pending-split-bill { padding: 16px; } }

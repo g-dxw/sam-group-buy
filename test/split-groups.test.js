@@ -104,6 +104,28 @@ test('FIFO allows part of one request to form, rounds frozen fees, and turns sur
   assert.equal(procurement.amountCents, 18000); assert.equal(procurement.split, true);
 });
 
+test('current period fees update pending and confirmed split orders while only formed portions are charged', t => {
+  const f = fixture(t, { batch: { feePolicy: { recommendedRateBps: 100, selfSelectedRateBps: null } } });
+  const first = submit(f, 3, { phone: '13800138001' });
+  const surplus = submit(f, 1, { phone: '13800138002' });
+  const snapshots = f.store.listOrderLines(f.batch.code).map(line => line.snapshot);
+  for (const line of f.store.listExportLines(f.batch.code)) f.store.markExported(f.batch.code, line.lineId, line.revision, `remote:${line.lineId}`);
+  f.service.updateBatch(f.batch.code, { feePolicy: { recommendedRateBps: 200, selfSelectedRateBps: null } });
+  assert.deepEqual(f.store.listExportLines(f.batch.code).map(line => [line.feeRateBps, line.amountCents, line.feeCents, line.revision, line.syncedRevision]),
+    [[200, 0, 0, 2, 1], [200, 0, 0, 2, 1]]);
+  confirm(f);
+  assert.deepEqual([f.service.queryOrders(f.batch, '13800138001').goodsTotalCents,
+    f.service.queryOrders(f.batch, '13800138001').feeTotalCents], [18000, 360]);
+  assert.equal(f.service.queryOrders(f.batch, '13800138002').totalCents, 0);
+  f.service.updateBatch(f.batch.code, { feePolicy: { recommendedRateBps: 300, selfSelectedRateBps: null } });
+  assert.equal(f.service.queryOrders(f.batch, '13800138001').feeTotalCents, 540);
+  assert.equal(f.service.queryOrders(f.batch, '13800138002').feeTotalCents, 0);
+  assert.equal(f.store.listExportLines(f.batch.code).find(line => line.lineId === surplus.lineId).feeRateBps, 300);
+  f.service.updateOrder(f.batch.code, first.lineId, { status: '已取消' });
+  assert.equal(f.service.queryOrders(f.batch, '13800138001').totalCents, 0);
+  assert.deepEqual(f.store.listOrderLines(f.batch.code).map(line => line.snapshot), snapshots);
+});
+
 test('top-up purchases ceiling packs while customer pays only requested shares; one policy confirmation is idempotent', t => {
   const f = fixture(t); submit(f, 5);
   const group = confirm(f, 'topUp');

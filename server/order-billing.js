@@ -41,12 +41,18 @@ export function lineCategory(line) {
   return line.snapshot?.selfSelected === true ? 'selfSelected' : 'recommended';
 }
 
-// A fee is rounded once per customer, period, frozen category and frozen rate.
+// A fee is rounded once per customer, period, saved category and applicable rate.
 // Largest-remainder allocation preserves that exact total in exported lines.
-export function billLines(input) {
-  const lines = input.map(line => ({ ...line, selfSelected: line.snapshot?.selfSelected === true || line.selfSelected === true,
-    feeCategory: lineCategory(line), feeRateBps: line.snapshot?.feeRateBps ?? line.feeRateBps ?? 0,
-    feeCents: 0, payableCents: line.amountCents }));
+export function billLines(input, { feePolicy } = {}) {
+  const policy = feePolicy === undefined ? null : normalizeFeePolicy(feePolicy);
+  const lines = input.map(line => {
+    const feeCategory = lineCategory(line);
+    const feeRateBps = policy
+      ? feeCategory === 'selfSelected' ? policy.selfSelectedRateBps ?? policy.recommendedRateBps : policy.recommendedRateBps
+      : line.snapshot?.feeRateBps ?? line.feeRateBps ?? 0;
+    return { ...line, selfSelected: line.snapshot?.selfSelected === true || line.selfSelected === true,
+      feeCategory, feeRateBps, feeCents: 0, payableCents: line.amountCents };
+  });
   const groups = new Map();
   for (const line of lines) {
     if (!Number.isInteger(line.feeRateBps) || line.feeRateBps < 0 || line.feeRateBps > 10_000) {
@@ -103,11 +109,11 @@ export function billingSummary(lines) {
     totalCents: goodsTotalCents === null ? null : addCents([goodsTotalCents, feeTotalCents]), feeBreakdown };
 }
 
-export function incrementalBilling(existing, additions) {
-  const before = billingSummary(billLines(existing));
-  const after = billingSummary(billLines([...existing, ...additions]));
+export function incrementalBilling(existing, additions, options = {}) {
+  const before = billingSummary(billLines(existing, options));
+  const after = billingSummary(billLines([...existing, ...additions], options));
   const goodsTotalCents = addCents(additions.map(line => line.amountCents));
-  const feeBreakdown = billingSummary(billLines(additions)).feeBreakdown.map(group => {
+  const feeBreakdown = billingSummary(billLines(additions, options)).feeBreakdown.map(group => {
     const match = row => row.category === group.category && row.rateBps === group.rateBps;
     return { ...group, feeCents: (after.feeBreakdown.find(match)?.feeCents || 0)
       - (before.feeBreakdown.find(match)?.feeCents || 0) };

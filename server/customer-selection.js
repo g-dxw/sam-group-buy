@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { DomainError } from './order-service.js';
 import { productVersion, payloadHash, samsStoreKey } from './local-store.js';
+import { validPrice } from './product-pricing.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SPU = /^[A-Za-z0-9_-]{1,120}$/;
@@ -78,7 +79,9 @@ export class CustomerSelection {
   product(raw, batch, keyword, queriedAt, { id, quoteRevision = 1 } = {}) {
     const match = this.localMatch(raw.spu_id, batch);
     const local = match.product;
-    const available = raw.selectable && raw.available === true && raw.on_sale === true && !match.stopped;
+    // Upstream sale and stock flags are informational for order registration.
+    // The administrator's explicit local stop still applies.
+    const available = raw.selectable && validPrice(raw.price_cents) && !match.stopped;
     let selfId = `self_${batch.samsStore.storeType}_${batch.samsStore.storeId}_${raw.spu_id}`;
     if (selfId.length > 128) selfId = `self_${batch.samsStore.storeType}_${batch.samsStore.storeId}_${createHash('sha256').update(raw.spu_id).digest('hex')}`;
     const recommended = Boolean(local && batch.productIds.includes(local.id));
@@ -140,10 +143,6 @@ export class CustomerSelection {
       || (row.storeType != null && Number(row.storeType) !== store.storeType)) throw blocked('商品详情与本期门店不一致，请重新查询。');
     const raw = this.sams.normalizeProducts([{ ...row, image: row.image || row.images?.[0] }],
       { store_id: store.storeId, store_type: store.storeType }, 1)[0];
-    const quantity = row.stockInfo?.stockQuantity;
-    raw.selectable = raw.selectable && row.isAvailable === true && row.isStoreAvailable === true
-      && row.isPutOnSale === true && Number.isSafeInteger(quantity) && quantity > 0;
-    if (!raw.selectable) raw.available = false;
     return { raw, queriedAt: queried_at };
   }
   async add(batchInput, token, body) {
@@ -156,12 +155,12 @@ export class CustomerSelection {
     const selection = this.store.getCustomerSelection(body.selectionId, batch.code, ownerHash);
     if (!selection || selection.expiresAt <= this.now() || selection.storeKey !== key) throw new DomainError(409, 'SAMS_SELECTION_EXPIRED', '查询结果已过期或采购门店已调整，请重新查询。');
     const original = selection.data.rows.find(row => row.spu_id === body.spuId);
-    if (!original?.selectable || original.available !== true || original.on_sale !== true) throw new DomainError(400, 'INVALID_SAMS_SELECTION', '所选商品缺少有效价格或可售状态，请选择其他商品。');
+    if (!original?.selectable || !validPrice(original.price_cents)) throw new DomainError(400, 'INVALID_SAMS_SELECTION', '所选商品缺少有效价格或完整信息，请重新查询。');
     const { raw, queriedAt } = await this.detail(body.spuId, batch.samsStore);
     const fresh = this.unchanged(batch, key);
     const product = this.product(raw, fresh, selection.data.keyword, queriedAt);
     this.service.assertSplitAvailable(this.service.splitRecommendation(fresh, product), product.id);
-    if (!product.selectable) throw blocked('商品已停售或库存不足，请选择其他商品。', [product.id]);
+    if (!product.selectable) throw blocked('商品报价无效或已被团长下架，请重新查询或选择其他商品。', [product.id]);
     if (product.selfSelected) {
       const previous = this.store.getCustomerProduct(batch.code, ownerHash, product.id);
       if (previous) { product.quoteRevision = (previous.product.quoteRevision || 1) + 1; product.version = quoteVersion(product); }
@@ -193,6 +192,15 @@ export class CustomerSelection {
             category: match.product.category, imageUrl: match.product.imageUrl || product.imageUrl,
             priceCents: match.product.priceCents, localVersion: productVersion(match.product),
             reusedProductId: match.product.id, priceSource: 'local', quoteRevision: product.quoteRevision || 1 };
+          product.version = quoteVersion(product);
+          this.store.saveCustomerProduct(batch.code, ownerHash, key, product, this.now());
+        }
+        if (!changed && !product.priceUnavailable && validPrice(product.priceCents)
+          && product.name && product.spec && product.unit && product.imageUrl
+          && (!product.onSale || !product.selectable)) {
+          // Recover saved quotes blocked only by the old upstream-availability
+          // policy; missing prices and explicit local stops remain blocked.
+          product = { ...product, onSale: true, selectable: true };
           product.version = quoteVersion(product);
           this.store.saveCustomerProduct(batch.code, ownerHash, key, product, this.now());
         }
@@ -251,7 +259,7 @@ export class CustomerSelection {
         // recommendation after this request started; the service resolves that
         // race against the freshly loaded batch before committing.
         product.selfSelected = true;
-        if (!Number.isSafeInteger(product.priceCents)) {
+        if (!validPrice(product.priceCents)) {
           product.priceCents = quote.product.priceCents;
           product.onSale = false; product.selectable = false; product.priceUnavailable = true;
           product.version = quoteVersion(product);
@@ -264,7 +272,7 @@ export class CustomerSelection {
     const outcomes = await Promise.allSettled(workers);
     const error = outcomes.find(outcome => outcome.status === 'rejected');
     if (error) throw error.reason;
-    if (changed) throw blocked('个人商品报价或库存已更新，请刷新个人清单后重新确认。', personal.map(item => item.productId));
+    if (changed) throw blocked('个人商品报价、规格或在售设置已更新，请刷新个人清单后重新确认。', personal.map(item => item.productId));
     return this.service.submit(batch, input, { customerProducts: prepared, ownerHash });
   }
   quote(batchInput, token, input) {

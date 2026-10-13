@@ -236,7 +236,7 @@ test('采购包价参考来源可选兼容旧拼份快照，新来源完整读�
   assert.equal(store.acknowledgements.length, 0);
 });
 
-test('真实本地拼份订单从报名到确认采购、缺货完整更新已备份明细，冻结价格费率且不重排', async t => {
+test('真实本地拼份订单更新原明细，未成团零金额也跟随当前费率，价格与成团分配保留', async t => {
   const store = new LocalStore({ path: ':memory:' });
   t.after(() => store.close());
   const product = { id: 'P1', name: pack.packProductName, spec: pack.packSpec, unit: pack.packUnit,
@@ -267,6 +267,14 @@ test('真实本地拼份订单从报名到确认采购、缺货完整更新已�
   const originalIds = api.rows.map(row => row.record_id);
   assert.equal(store.listExportLines(batch.code, { onlyDirty: true }).length, 0);
 
+  service.updateBatch(batch.code, { feePolicy: { recommendedRateBps: 200, selfSelectedRateBps: null } });
+  assert.equal(store.listExportLines(batch.code, { onlyDirty: true }).length, 2);
+  assert.ok(store.listExportLines(batch.code).every(line => line.amountCents === 0 && line.feeCents === 0));
+  assert.equal((await sync.syncOrders(batch.code)).status, 'success');
+  assert.deepEqual(api.rows.map(row => row.record_id), originalIds);
+  assert.deepEqual(api.rows.map(row => row.fields['同步代购费率']), [2, 2]);
+  assert.deepEqual(api.rows.map(row => row.fields['同步应付金额']), [0, 0]);
+
   service.updateBatch(batch.code, { collecting: false });
   clock = '2026-10-13T02:00:00Z';
   const confirmed = service.confirmSplit(batch.code, 'P1', { remainderPolicy: 'cancel' });
@@ -276,16 +284,20 @@ test('真实本地拼份订单从报名到确认采购、缺货完整更新已�
   assert.equal((await sync.syncOrders(batch.code)).status, 'success');
   assert.deepEqual(api.rows.map(row => row.record_id), originalIds);
   assert.deepEqual(api.rows.map(row => row.fields['同步金额']), [60, 120]);
-  assert.deepEqual(api.rows.map(row => row.fields['同步代购费']), [0.6, 1.2]);
+  assert.deepEqual(api.rows.map(row => row.fields['同步代购费']), [1.2, 2.4]);
   assert.deepEqual(api.rows.map(row => JSON.parse(row.fields[splitField]).formedQuantity), [1, 2]);
   assert.deepEqual(api.rows.map(row => JSON.parse(row.fields[splitField]).unformedQuantity), [0, 2]);
   assert.equal(store.listExportLines(batch.code, { onlyDirty: true }).length, 0);
 
   store.importProducts([{ ...product, priceCents: 25000 }]);
   service.updateBatch(batch.code, { feePolicy: { recommendedRateBps: 900, selfSelectedRateBps: null } });
+  assert.equal(store.listExportLines(batch.code, { onlyDirty: true }).length, 2);
   assert.equal((await sync.syncOrders(batch.code)).status, 'success');
   assert.deepEqual(api.rows.map(row => row.fields['同步单价']), [60, 60]);
-  assert.deepEqual(api.rows.map(row => row.fields['同步代购费率']), [1, 1]);
+  assert.deepEqual(api.rows.map(row => row.fields['同步代购费率']), [9, 9]);
+  assert.deepEqual(api.rows.map(row => row.fields['同步代购费']), [5.4, 10.8]);
+  assert.deepEqual(api.rows.map(row => JSON.parse(row.fields[splitField]).formedQuantity), [1, 2]);
+  assert.deepEqual(api.rows.map(row => JSON.parse(row.fields[splitField]).unformedQuantity), [0, 2]);
   assert.ok(api.rows.every(row => JSON.parse(row.fields[splitField]).packPriceCents === 18000));
 
   const second = store.listExportLines(batch.code)[1];
@@ -295,7 +307,7 @@ test('真实本地拼份订单从报名到确认采购、缺货完整更新已�
   assert.equal((await sync.syncOrders(batch.code)).status, 'success');
   assert.deepEqual(api.rows.map(row => row.record_id), originalIds);
   assert.deepEqual(api.rows.map(row => row.fields['同步金额']), [60, 0]);
-  assert.deepEqual(api.rows.map(row => row.fields['同步代购费']), [0.6, 0]);
+  assert.deepEqual(api.rows.map(row => row.fields['同步代购费']), [5.4, 0]);
   assert.deepEqual(api.rows.map(row => JSON.parse(row.fields[splitField]).formedQuantity), [1, 2]);
   assert.equal(store.listExportLines(batch.code, { onlyDirty: true }).length, 0);
 });

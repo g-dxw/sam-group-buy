@@ -35,6 +35,6 @@ export function PendingSplitBill({ quantity, goodsCents }) {
   if (!(quantity > 0)) return null;
   return <div className="customer-pending-split-bill">
     <div><strong>待拼 {quantity} 份</strong><span>预计商品金额 {money(goodsCents)}</span></div>
-    <p>暂未计入上方应付金额。截单后按成团份数和下单时的费率计算；未成团部分不收费。</p>
+    <p>暂未计入上方应付金额。截单后按成团份数和本期最新代购费率计算；未成团部分不收费。</p>
   </div>;
 }

@@ -1,14 +1,14 @@
 .customer-fee-policy{display:flex;align-items:center;gap:8px 20px;flex-wrap:wrap;padding:14px 18px;margin:0 0 24px;border:1px solid var(--border);border-radius:12px;background:#fff;font-size:13px;line-height:1.65}
-.customer-fee-policy>strong{color:var(--green)}
+.customer-fee-policy>strong{color:var(--primary)}
 .customer-fee-policy>small{color:var(--muted);font-size:12px}
-.customer-product-fee{font-size:12px;color:var(--green);margin-top:10px;line-height:1.6}
+.customer-product-fee{font-size:12px;color:var(--primary);margin-top:10px;line-height:1.6}
 .customer-order-fees{display:grid;gap:12px;padding:20px 0;margin-top:18px;border-top:1px solid var(--border);font-size:14px;line-height:1.6;min-width:0}
 .customer-order-fees>div{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
 .customer-order-fees strong{font-variant-numeric:tabular-nums;white-space:nowrap}
 .customer-fee-detail{color:var(--muted);font-size:12px}
 .customer-fee-detail small{display:block;font-size:12px}
 .customer-order-fees .customer-fee-payable{border-top:1px solid var(--border);padding-top:14px;font-weight:600}
-.customer-fee-payable>strong{font-size:25px;color:var(--green)}
+.customer-fee-payable>strong{font-size:25px;color:var(--primary)}
 .order-result>.customer-order-fees{padding:22px 26px;margin:0}
 .customer-fee-quote-state{min-height:22px;font-size:12px;line-height:1.7;color:var(--muted)}
 .customer-fee-quote-state.error{color:#ad493f}

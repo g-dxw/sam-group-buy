@@ -32,6 +32,7 @@ const removeStored = key => { try { localStorage.removeItem(key); } catch { /* S
 const contactStorage = () => { try { return localStorage; } catch { return null; } };
 const productDescription = product => product?.description?.trim() || (product?.spec !== '详见商品名称' ? product?.spec?.trim() : '') || '';
 const knownPrice = product => Number.isSafeInteger(product?.priceCents) && product.priceCents >= 0;
+// The server resolves checkout eligibility; upstream stock and sale flags are informational.
 const purchasable = product => product?.onSale === true && product?.selectable !== false && knownPrice(product);
 const personalStorageError = '当前浏览器无法保存个人清单，请允许本站保存数据后重试，或使用 Safari / Chrome 打开本期链接。';
 
@@ -137,6 +138,8 @@ export default function App() {
   const [queryState, setQueryState] = useState('idle');
   const [queryError, setQueryError] = useState('');
   const [queryResult, setQueryResult] = useState(null);
+  const [queryRefreshing, setQueryRefreshing] = useState(false);
+  const [queryRefreshError, setQueryRefreshError] = useState('');
   const [notification, setNotification] = useState('');
   const [cartQuote, setCartQuote] = useState(null);
   const [quoteState, setQuoteState] = useState('idle');
@@ -152,6 +155,15 @@ export default function App() {
   const customerGeneration = useRef(0);
   const customerAddingRef = useRef(false);
   const appAlive = useRef(true);
+  const pageAlive = useRef(true);
+  const catalogValue = useRef(null);
+  const catalogRequest = useRef(null);
+  const catalogGeneration = useRef(0);
+  const queryRequest = useRef(null);
+  const queryGeneration = useRef(0);
+  const queryPolicyChecked = useRef('');
+  const queriedOrder = useRef({ state: queryState, result: queryResult });
+  queriedOrder.current = { state: queryState, result: queryResult };
   const products = catalog?.products || [];
   const catalogProductMap = useMemo(() => new Map(products.map(product => [product.id, product])), [products]);
   const productMap = useMemo(() => new Map([...customerProducts, ...products].map(product => [product.id, product])), [products, customerProducts]);
@@ -165,6 +177,8 @@ export default function App() {
   const knownCartTotal = items.every(item => knownPrice(item.product)) && !personalUnresolved;
   const orderWorking = activeStatuses.has(submission?.status) || submission?.requiresReview || submitBusy;
   const working = orderWorking || Boolean(customerAdding);
+  const refreshContext = useRef(null);
+  refreshContext.current = { working, catalogState, identity };
   const cutoffPassed = catalog?.batch.cutoffAt && new Date(catalog.batch.cutoffAt).getTime() <= Date.now();
   const collecting = Boolean(catalog?.batch.collecting && !cutoffPassed && catalogState === 'ready');
   const shownProducts = useMemo(() => products.filter(product => `${product.name} ${product.spec} ${product.id}`.toLowerCase().includes(search.trim().toLowerCase())), [products, search]);
@@ -307,17 +321,36 @@ export default function App() {
 
   async function loadCatalog({ silent = false } = {}) {
     if (!silent) setCatalogState('loading');
-    try {
-      const result = await api(`${base}/catalog`);
-      setCatalog(result);
-      setCatalogState('ready');
-      setCatalogError('');
-      return result;
-    } catch (error) {
-      setCatalogState(error.httpStatus === 410 ? 'ended' : 'error');
-      setCatalogError(error.message);
-      throw error;
-    }
+    if (catalogRequest.current) return catalogRequest.current.promise;
+    const version = ++catalogGeneration.current;
+    const controller = new AbortController();
+    const flight = { controller, promise: null };
+    catalogRequest.current = flight;
+    let timedOut = false;
+    const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 15000);
+    flight.promise = (async () => {
+      try {
+        const result = await api(`${base}/catalog`, { signal: controller.signal });
+        if (!pageAlive.current || version !== catalogGeneration.current) return;
+        if (!result?.batch || !Array.isArray(result.products)) throw new Error('本期商品信息暂不可用，请重新加载。');
+        // Unchanged checks keep card state, checkout fields and quote requests intact.
+        if (JSON.stringify(result) !== JSON.stringify(catalogValue.current)) {
+          catalogValue.current = result;
+          setCatalog(result);
+        }
+        setCatalogState('ready'); setCatalogError('');
+        return result;
+      } catch (error) {
+        if (!pageAlive.current || version !== catalogGeneration.current || controller.signal.aborted && !timedOut) return;
+        setCatalogState(error.httpStatus === 410 ? 'ended' : 'error');
+        setCatalogError(timedOut ? '本期商品更新超时，请重试。' : error.message);
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+        if (catalogRequest.current === flight) catalogRequest.current = null;
+      }
+    })();
+    return flight.promise;
   }
 
   async function refreshProducts() {
@@ -362,7 +395,15 @@ export default function App() {
     return () => { disposed = true; clearTimeout(debounce); clearTimeout(timeout); controller.abort(); };
   }, [quoteKey, view, knownCartTotal, hasUnavailable, collecting, working, identity.token, quoteRefresh]);
 
-  useEffect(() => { loadCatalog().catch(() => {}); }, [code]);
+  useEffect(() => {
+    pageAlive.current = true;
+    loadCatalog().catch(() => {});
+    return () => {
+      pageAlive.current = false; catalogGeneration.current += 1; queryGeneration.current += 1;
+      catalogRequest.current?.controller.abort(); catalogRequest.current = null;
+      queryRequest.current?.controller.abort(); queryRequest.current = null;
+    };
+  }, [code]);
   useEffect(() => {
     appAlive.current = true;
     loadCustomerProducts().catch(() => {});
@@ -393,15 +434,43 @@ export default function App() {
   }, [notification]);
   useEffect(() => {
     if (!catalog) return;
-    const refresh = () => {
-      loadCatalog({ silent: true }).catch(() => {});
-      if (identity.token && !identity.error) loadCustomerProducts({ silent: true }).catch(() => {});
+    let disposed = false;
+    let lastResume = 0;
+    let lastPersonal = Date.now();
+    const refresh = async () => {
+      if (disposed || document.visibilityState !== 'visible' || refreshContext.current.working || refreshContext.current.catalogState === 'ended') return;
+      try {
+        const next = await loadCatalog({ silent: true });
+        if (!next || disposed || document.visibilityState !== 'visible' || refreshContext.current.working) return;
+        const query = queriedOrder.current;
+        if (query.state === 'ready' && query.result?.feePolicyVersion !== next.batch.feePolicyVersion
+          && queryPolicyChecked.current !== next.batch.feePolicyVersion) {
+          queryOrders(null, { silent: true }).catch(() => {});
+        }
+        // Personal quote availability keeps its former one-minute cadence.
+        const customer = refreshContext.current.identity;
+        if (Date.now() - lastPersonal >= 60000 && customer.token && !customer.error) {
+          lastPersonal = Date.now(); loadCustomerProducts({ silent: true }).catch(() => {});
+        }
+      } catch { /* The catalog notice preserves the last visible list and offers retry. */ }
     };
-    const timer = setInterval(refresh, 60000);
-    const onVisible = () => { if (document.visibilityState === 'visible') refresh(); };
+    const onResume = () => {
+      if (document.visibilityState !== 'visible' || Date.now() - lastResume < 2000) return;
+      lastResume = Date.now(); refresh();
+    };
+    const timer = setInterval(() => refresh(), 30000);
+    const onVisible = () => { if (document.visibilityState === 'visible') onResume(); };
     document.addEventListener('visibilitychange', onVisible);
-    return () => { clearInterval(timer); document.removeEventListener('visibilitychange', onVisible); };
+    window.addEventListener('focus', onResume);
+    return () => { disposed = true; clearInterval(timer); document.removeEventListener('visibilitychange', onVisible); window.removeEventListener('focus', onResume); };
   }, [code, Boolean(catalog), loadCustomerProducts, identity.token, identity.error]);
+  useEffect(() => {
+    const query = queriedOrder.current;
+    if (view === 'query' && !working && document.visibilityState === 'visible' && query.state === 'ready'
+      && catalog?.batch.feePolicyVersion && query.result?.feePolicyVersion !== catalog.batch.feePolicyVersion) {
+      if (queryPolicyChecked.current !== catalog.batch.feePolicyVersion) queryOrders(null, { silent: true }).catch(() => {});
+    }
+  }, [view, working, catalog?.batch.feePolicyVersion, queryState, queryResult?.feePolicyVersion]);
 
   function navigate(next) {
     location.hash = next === 'products' ? '' : next;
@@ -598,20 +667,53 @@ export default function App() {
     } finally { setSubmitBusy(false); }
   }
 
-  async function queryOrders(event) {
+  async function queryOrders(event, { silent = false } = {}) {
     event?.preventDefault();
-    const enteredPhone = queryFormRef.current ? String(new FormData(queryFormRef.current).get('query-phone') ?? '') : queryPhone;
-    setQueryPhone(enteredPhone);
+    const previous = queriedOrder.current;
+    if (silent && (previous.state !== 'ready' || !previous.result?.phone || refreshContext.current.working)) return;
+    if (silent && queryRequest.current) return queryRequest.current.promise;
+    const enteredPhone = silent ? previous.result.phone : queryFormRef.current ? String(new FormData(queryFormRef.current).get('query-phone') ?? '') : queryPhone;
     const phone = cleanPhone(enteredPhone);
-    if (!/^1[3-9]\d{9}$/.test(phone)) { setQueryError('请填写有效的 11 位手机号码。'); return; }
-    setQueryState('loading');
-    setQueryError('');
-    setQueryResult(null);
-    try {
-      const result = await api(`${base}/query`, { method: 'POST', body: JSON.stringify({ phone }) });
-      setQueryResult(result);
-      setQueryState('ready');
-    } catch (error) { setQueryState('error'); setQueryError(error.message); }
+    if (!silent) setQueryPhone(enteredPhone);
+    queryRequest.current?.controller.abort();
+    queryRequest.current = null;
+    const version = ++queryGeneration.current;
+    if (!/^1[3-9]\d{9}$/.test(phone)) { setQueryRefreshing(false); setQueryError('请填写有效的 11 位手机号码。'); return; }
+    const controller = new AbortController();
+    const flight = { controller, promise: null };
+    queryRequest.current = flight;
+    const requestedPolicy = catalogValue.current?.batch.feePolicyVersion;
+    if (silent) setQueryRefreshing(true);
+    else {
+      queriedOrder.current = { state: 'loading', result: null };
+      setQueryState('loading'); setQueryError(''); setQueryResult(null);
+    }
+    setQueryRefreshError('');
+    let timedOut = false;
+    const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 15000);
+    flight.promise = (async () => {
+      try {
+        const result = await api(`${base}/query`, { method: 'POST', body: JSON.stringify({ phone }), signal: controller.signal });
+        if (!pageAlive.current || version !== queryGeneration.current) return;
+        if (result.phone !== phone || !Array.isArray(result.products)) throw new Error('订单查询结果暂不可用，请重新查询。');
+        const value = { ...result, feePolicyVersion: result.feePolicyVersion || requestedPolicy };
+        queryPolicyChecked.current = requestedPolicy;
+        queriedOrder.current = { state: 'ready', result: value };
+        setQueryResult(value); setQueryState('ready');
+        if (document.visibilityState === 'visible' && value.feePolicyVersion !== catalogValue.current?.batch.feePolicyVersion) loadCatalog({ silent: true }).catch(() => {});
+        return value;
+      } catch (error) {
+        if (!pageAlive.current || version !== queryGeneration.current || controller.signal.aborted && !timedOut) return;
+        const message = timedOut ? '订单费用更新超时，请重试。' : error.message;
+        if (silent) setQueryRefreshError(`订单费用暂未刷新，当前显示上次查询结果。${message}`);
+        else { queriedOrder.current = { state: 'error', result: null }; setQueryState('error'); setQueryError(message); }
+      } finally {
+        clearTimeout(timeout);
+        if (queryRequest.current === flight) queryRequest.current = null;
+        if (pageAlive.current && version === queryGeneration.current) setQueryRefreshing(false);
+      }
+    })();
+    return flight.promise;
   }
 
   const batch = catalog?.batch;
@@ -622,7 +724,7 @@ export default function App() {
   return <>
     <header className="site-header"><div className="header-inner customer-batch-header">
       <div className="customer-header-start">
-        <button className="brand" type="button" onClick={() => navigate('products')} aria-label="返回商品列表"><span className="brand-mark"><Icon name="bag" size={22} /></span><span>一起逛山姆<small>本期代购收集</small></span></button>
+        <button className="brand" type="button" onClick={() => navigate('products')} aria-label="返回商品列表"><img className="brand-mark" src="/images/sams-club-logo.png" alt="山姆会员商店 Logo" width="52" height="52" /><span>一起逛山姆<small>本期代购收集</small></span></button>
         {activityTitle && <div className="customer-header-context"><strong>{activityTitle}</strong>{groupContext && activityTitle !== groupContext && <small>{groupContext}</small>}</div>}
       </div>
       <nav aria-label="主要导航"><button className={view === 'products' ? 'nav-active' : ''} onClick={() => navigate('products')}><Icon name="leaf" /><span>选商品</span></button><button className={view === 'cart' ? 'nav-active' : ''} onClick={() => navigate('cart')}><Icon name="bag" /><span>购物车</span>{itemCount > 0 && <b className="count-badge">{itemCount}</b>}</button><button className={view === 'query' ? 'nav-active' : ''} onClick={() => navigate('query')}><Icon name="list" /><span>查订单</span></button></nav>
@@ -646,7 +748,7 @@ export default function App() {
               {batch && <FeePolicyNotice policy={batch.feePolicy} showExplanation={false} />}
               <BatchPickupInfo batch={batch} />
             </div>
-            <div className="hero-art" aria-hidden="true"><svg viewBox="0 0 280 225"><circle cx="145" cy="109" r="97" fill="#e5eddb"/><ellipse cx="142" cy="201" rx="97" ry="9" fill="#d7dfce"/><path d="m68 88 145-6-17 114H87Z" fill="#c89357"/><path d="M89 89c0-65 104-71 102-5" fill="none" stroke="#9c733f" strokeWidth="9"/><path d="m93 61 24 8-17 70-24-8Z" fill="#f8e8c7"/><path d="m100 52 19 6-1 18-24-8Z" fill="#348268"/><rect x="145" y="54" width="36" height="86" rx="18" fill="#d29642" transform="rotate(20 163 97)"/><path d="m158 76 14 5m-19 12 14 5m-19 12 14 5" stroke="#bd7c2c" strokeWidth="3"/><path d="M181 105c-9-20-1-33 11-31 0-13 17-20 23-7 17-4 25 12 14 23 15 9 2 28-12 21Z" fill="#477d47"/><path d="m187 145 17-48" stroke="#7eaa62" strokeWidth="9"/><path d="m68 88 145-6-17 114H87Z" fill="#e4b47c"/><path d="M101 148h71" stroke="#bd8b56" strokeWidth="1.5"/><path d="M139 166c-17-7-20-18-11-25 10 1 17 11 11 25Zm0 0c2-21 10-28 20-22 1 11-8 20-20 22Z" fill="#557854"/><path d="M139 166v12" stroke="#557854" strokeWidth="2"/><circle cx="50" cy="62" r="4" fill="#d7a569"/><path d="m231 42 5 4m-5 0 5-4" stroke="#729364" strokeWidth="2"/><circle cx="232" cy="156" r="5" fill="#abc69d"/></svg><span>好物一起买 · 生活慢慢选</span></div>
+            <div className="hero-art" aria-hidden="true"><svg viewBox="0 0 280 225"><circle cx="145" cy="109" r="97" fill="#e1ecf9"/><ellipse cx="142" cy="201" rx="97" ry="9" fill="#ccdced"/><path d="m68 88 145-6-17 114H87Z" fill="#c89357"/><path d="M89 89c0-65 104-71 102-5" fill="none" stroke="#9c733f" strokeWidth="9"/><path d="m93 61 24 8-17 70-24-8Z" fill="#f8e8c7"/><path d="m100 52 19 6-1 18-24-8Z" fill="#348268"/><rect x="145" y="54" width="36" height="86" rx="18" fill="#d29642" transform="rotate(20 163 97)"/><path d="m158 76 14 5m-19 12 14 5m-19 12 14 5" stroke="#bd7c2c" strokeWidth="3"/><path d="M181 105c-9-20-1-33 11-31 0-13 17-20 23-7 17-4 25 12 14 23 15 9 2 28-12 21Z" fill="#477d47"/><path d="m187 145 17-48" stroke="#7eaa62" strokeWidth="9"/><path d="m68 88 145-6-17 114H87Z" fill="#e4b47c"/><path d="M101 148h71" stroke="#bd8b56" strokeWidth="1.5"/><path d="M139 166c-17-7-20-18-11-25 10 1 17 11 11 25Zm0 0c2-21 10-28 20-22 1 11-8 20-20 22Z" fill="#557854"/><path d="M139 166v12" stroke="#557854" strokeWidth="2"/><circle cx="50" cy="62" r="4" fill="#d7a569"/><path d="m231 42 5 4m-5 0 5-4" stroke="#7095be" strokeWidth="2"/><circle cx="232" cy="156" r="5" fill="#9cb9dc"/></svg><span>好物一起买 · 生活慢慢选</span></div>
           </section>
           {!collecting && <div className="notice"><Icon name="info" /><span>本期已停止收集，你仍可以查看商品和查询自己的订单。</span></div>}
           <section className="catalog-section" aria-label="商品列表"><div className="section-heading"><div><span className="overline">THIS WEEK’S PICKS</span><h2>本期好物 <span>{products.length} 件商品</span></h2></div><label className="search-field"><Icon name="search" size={19} /><input type="search" data-product-image-focus-fallback aria-label="搜索商品" placeholder="搜索商品名称、规格" ref={searchInputRef} defaultValue={search} onChange={updateSearch} onInput={updateSearch} onCompositionEnd={updateSearch} onBlur={updateSearch} />{search && <button aria-label="清空搜索" type="button" onClick={clearSearch}><Icon name="close" size={15} /></button>}</label></div>
@@ -664,7 +766,8 @@ export default function App() {
           {queryState === 'idle' && <div className="query-guide"><span className="empty-icon"><Icon name="list" size={32} /></span><h2>清单、数量、采购进度</h2><p>本期的每一次补单，都在同一份清单里。</p><div><span><Icon name="check" size={15} />商品数量合并</span><span><Icon name="check" size={15} />采购状态随时查看</span></div></div>}
           {queryState === 'loading' && <div className="loading-panel" role="status"><span className="spinner" />正在查找本期订单…</div>}
           {queryState === 'ready' && !queryResult?.hasOrders && (queryResult?.pendingCount > 0 ? <EmptyState icon="clock" title="你的订单仍在确认中" description={`有 ${queryResult.pendingCount} 次提交正在确认保存，完成后会显示商品清单。请勿重复下单。`}><button className="button secondary" onClick={() => queryOrders()}>刷新确认结果</button></EmptyState> : <EmptyState icon="search" title="本期还没有找到你的订单" description="检查手机号是否正确，或先选购商品并提交。"><button className="button secondary" onClick={() => navigate('products')}>去选商品</button></EmptyState>)}
-          {queryState === 'ready' && queryResult?.hasOrders && <div className="order-result"><div className="order-result-heading"><div><span className="order-label">本期订单</span><h2>{queryResult.phone}</h2></div><button className="text-button" onClick={() => queryOrders()}><Icon name="clock" size={15} />刷新状态</button></div>{queryResult.pendingCount > 0 && <div className="notice"><Icon name="clock" /><span>有 {queryResult.pendingCount} 次提交正在确认，确认完成后会合并到下面的清单。</span></div>}<div className="query-products">{queryResult.products.map(product => <article className="query-item" key={product.id}><ProductImage product={product} /><div className="query-item-info"><h3>{product.name}{product.selfSelected && <span className="self-selected-text">自选</span>}</h3><p>{productDescription(product)}{product.unit ? ` · ${product.unit}` : ''}</p><SplitOrderInfo split={product.split} /><div className="status-chips">{product.statuses.map(({ status, quantity }) => <span className={`status-chip ${['缺货', '已取消', 'out_of_stock', 'cancelled', 'canceled'].includes(status) ? 'muted-chip' : ''}`} key={status}>{labels[status] || status} {quantity}{product.unit || '份'}</span>)}</div></div><div className="query-item-amount"><strong>{product.missing ? '待确认' : money(product.amountCents)}</strong><small>累计 {product.quantity}{product.unit || '份'}</small>{!product.missing && <small>{product.mixedPrices ? '多次报价' : knownPrice(product) ? `${money(product.priceCents)} / ${product.unit || '份'}` : '单价待确认'}</small>}</div></article>)}</div><OrderFees billing={queryResult} goodsLabel="本期已确认商品金额" totalLabel="本期应付合计" /><PendingSplitBill quantity={queryResult.pendingQuantity} goodsCents={queryResult.pendingGoodsCents} /><div className="order-contact"><Icon name="info" size={18} /><p>{queryResult.contactNote || batch?.contactNote || '需要修改数量、取消商品或确认缺货情况，请联系代购。'}<small>缺货和已取消商品不计商品金额及代购费。新订单按确认时的价格和费率计算。</small></p></div></div>}
+          {queryRefreshError && <div className="notice error" role="alert"><span>{queryRefreshError}</span><button type="button" disabled={queryRefreshing || working} onClick={() => queryOrders(null, { silent: true })}>重新核对</button></div>}
+          {queryState === 'ready' && queryResult?.hasOrders && <div className="order-result"><div className="order-result-heading"><div><span className="order-label">本期订单</span><h2>{queryResult.phone}</h2></div><button className="text-button" disabled={queryRefreshing} onClick={() => queryOrders()}><Icon name="clock" size={15} />{queryRefreshing ? '正在更新…' : '刷新状态'}</button></div>{queryResult.pendingCount > 0 && <div className="notice"><Icon name="clock" /><span>有 {queryResult.pendingCount} 次提交正在确认，确认完成后会合并到下面的清单。</span></div>}<div className="query-products">{queryResult.products.map(product => <article className="query-item" key={product.id}><ProductImage product={product} /><div className="query-item-info"><h3>{product.name}{product.selfSelected && <span className="self-selected-text">自选</span>}</h3><p>{productDescription(product)}{product.unit ? ` · ${product.unit}` : ''}</p><SplitOrderInfo split={product.split} /><div className="status-chips">{product.statuses.map(({ status, quantity }) => <span className={`status-chip ${['缺货', '已取消', 'out_of_stock', 'cancelled', 'canceled'].includes(status) ? 'muted-chip' : ''}`} key={status}>{labels[status] || status} {quantity}{product.unit || '份'}</span>)}</div></div><div className="query-item-amount"><strong>{product.missing ? '待确认' : money(product.amountCents)}</strong><small>累计 {product.quantity}{product.unit || '份'}</small>{!product.missing && <small>{product.mixedPrices ? '多次报价' : knownPrice(product) ? `${money(product.priceCents)} / ${product.unit || '份'}` : '单价待确认'}</small>}</div></article>)}</div><OrderFees billing={queryResult} goodsLabel="本期已确认商品金额" totalLabel="本期应付合计" /><PendingSplitBill quantity={queryResult.pendingQuantity} goodsCents={queryResult.pendingGoodsCents} /><div className="order-contact"><Icon name="info" size={18} /><p>{queryResult.contactNote || batch?.contactNote || '需要修改数量、取消商品或确认缺货情况，请联系代购。'}<small>商品保留下单时的单价，代购费按本期最新比例计算；比例调整后已有订单同步重算。缺货和已取消部分不收费。</small></p></div></div>}
         </section>}
       </>}
       <ServiceFooter><span><Icon name="leaf" size={16} />一起选好物，日常多一点美好。</span><span>{batch?.contactNote || '修改订单或了解领取安排，请联系代购。'}</span></ServiceFooter>

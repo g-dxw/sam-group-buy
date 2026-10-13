@@ -4,13 +4,13 @@
   flex-wrap: wrap;
   gap: 4px 12px;
   margin: -4px 0 8px;
-  color: var(--muted, #708176);
+  color: var(--muted, #5d7286);
   font-size: 12px;
   line-height: 1.7;
 }
 .customer-contact-memory > p { flex: 1 1 220px; margin: 0; }
 .customer-contact-memory > .text-button { min-height: 44px; padding: 8px 0; text-align: left; }
-.customer-contact-message { flex-basis: 100%; margin: 6px 0 0; color: var(--green, #236749); font-size: 12px; line-height: 1.7; }
+.customer-contact-message { flex-basis: 100%; margin: 6px 0 0; color: var(--primary, #003a81); font-size: 12px; line-height: 1.7; }
 .query-contact-memory { margin: 12px 0 0; }
 @media (max-width: 580px) {
   .customer-contact-memory { align-items: flex-start; gap: 0 12px; }

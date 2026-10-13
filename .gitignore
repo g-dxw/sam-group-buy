@@ -5,6 +5,7 @@ dist/
 .env.*
 !.env.example
 .artifacts/
+outputs/
 *.log
 .DS_Store
 test-results/

@@ -306,7 +306,7 @@ export class LocalService {
       additions.map(line => [line.productId, line.version, line.quantity, line.amountCents, line.snapshot.feeCategory, line.snapshot.feeRateBps]),
       existing.map(line => [line.lineId, line.quantity, line.status, line.amountCents, line.feeCategory, line.feeRateBps, line.split || null])
         .sort((a, b) => a[0].localeCompare(b[0]))]);
-    return { ...incrementalBilling(existing, additions), feePolicyVersion: feePolicyVersion(batch), feeQuoteVersion: quoteVersion,
+    return { ...incrementalBilling(existing, additions, { feePolicy: batch.feePolicy }), feePolicyVersion: feePolicyVersion(batch), feeQuoteVersion: quoteVersion,
       quoteExpired: personalIds.some(id => Date.parse(products.get(id).expiresAt) <= this.now().getTime()),
       pendingSplit: additions.some(line => line.snapshot.split),
       pendingGoodsCents: addCents(additions.filter(line => line.snapshot.split).map(line => line.amountCents)),
@@ -369,7 +369,7 @@ export class LocalService {
     const phone = normalizePhone(inputPhone);
     const result = this.completedLines(this.enrichedLines(batch).filter(line => line.phone === phone));
     const products = aggregateProducts(result.complete);
-    return { phone, products, ...billingSummary(result.complete), ...pendingSplitSummary(result.complete), pendingCount: result.pending,
+    return { phone, products, ...billingSummary(result.complete), ...pendingSplitSummary(result.complete), feePolicyVersion: feePolicyVersion(batch), pendingCount: result.pending,
       hasOrders: products.length > 0, contactNote: batch.contactNote };
   }
   overview() {

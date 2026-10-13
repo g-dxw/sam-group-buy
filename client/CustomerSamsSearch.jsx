@@ -135,6 +135,6 @@ export default function CustomerSamsSearch({ base, api, store, initialKeyword = 
     {loading && <div className="customer-sams-loading" role="status"><span className="spinner" />正在查询山姆商品…</div>}
     {!loading && results.query && !results.products.length && !error && <div className="customer-sams-empty"><h3>暂未找到匹配的商品</h3><p>换个商品名称试试，或联系团长帮你找。</p></div>}
     {!results.products.length && results.has_more && renderMore({ allLoaded: true, visibleEndReached: true })}
-    <p className="customer-sams-help">已上架同款沿用后台售价；标有“按份拼单”的商品按每份规格和价格报名，截单后确认成团。其他自选商品按山姆查询价格计算。属于本期推荐的商品使用推荐费率，其余使用自选费率，费用在结算时单独展示。价格和库存可能变化，提交时会再次核对。</p>
+    <p className="customer-sams-help">已上架同款沿用后台售价；标有“按份拼单”的商品按每份规格和价格报名，截单后确认成团。其他自选商品按山姆查询价格计算。属于本期推荐的商品使用推荐费率，其余使用自选费率，费用在结算时单独展示。价格可能变化，提交时会再次核对。</p>
   </section>;
 }

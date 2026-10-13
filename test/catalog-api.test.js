@@ -242,7 +242,7 @@ test('real fee API validates both confirmation versions, quotes without upstream
   assert.equal(stats.goodsTotalCents, 0);
   assert.equal(stats.feeTotalCents, 0);
   assert.equal(stats.orders[0].priceCents, 50);
-  assert.equal(stats.orders[0].feeRateBps, 100);
+  assert.equal(stats.orders[0].feeRateBps, 500);
   assert.deepEqual(await remoteCalls(), networkBefore);
 });
 

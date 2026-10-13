@@ -34,7 +34,7 @@ export function CustomerFeeBill({ customer, money }) {
   return <section className="admin-customer-bill" aria-label="顾客金额明细">
     <dl><div><dt>商品金额</dt><dd>{money(totals.goods)}</dd></div><div><dt>代购费</dt><dd>{money(totals.fee)}</dd></div><div className="is-payable"><dt>应付金额</dt><dd>{money(totals.payable)}</dd></div></dl>
     {Array.isArray(customer.feeBreakdown) && customer.feeBreakdown.length > 0 && <ul className="admin-fee-breakdown">{customer.feeBreakdown.map((row, index) => <li key={`${row.category}:${row.rateBps}:${index}`}><span>{feeCategoryLabel(row.category)} · {formatFeeRate(row.rateBps)}<small>商品金额 {money(row.goodsCents)}</small></span><strong>代购费 {money(row.feeCents)}</strong></li>)}</ul>}
-    <p className="admin-help">费用按各次下单时的费率保留；缺货和已取消商品不收代购费。</p>
+    <p className="admin-help">代购费按本期当前比例计算，比例调整后已有订单同步重算；缺货和已取消商品不收代购费。</p>
   </section>;
 }
 
@@ -66,6 +66,6 @@ export default function BatchFees({ value }) {
       <label className="admin-field" htmlFor={`${id}-self`}>自选商品代购费率（%）<input ref={selfField} id={`${id}-self`} name="selfSelectedFeePercent" type="number" inputMode="decimal" min="0" max="100" step="0.01" required={!follows} disabled={follows} value={follows ? recommended : selfSelected} onChange={event => change('selfSelected', event)} onInput={event => change('selfSelected', event)} onBlur={event => validate('selfSelected', event)} aria-invalid={!follows && Boolean(errors.selfSelected)} aria-describedby={!follows && errors.selfSelected ? `${id}-self-error` : `${id}-help`} />{!follows && errors.selfSelected && <span className="admin-fee-field-error" id={`${id}-self-error`} role="alert">{errors.selfSelected}</span>}</label>
     </div>
     <label className="admin-checkbox"><input name="selfSelectedFeeFollows" type="checkbox" checked={follows} onChange={event => { const next = event.currentTarget.checked; if (!next) setSelfSelected(recommended); selfField.current?.setCustomValidity(''); setFollows(next); setErrors(previous => ({ ...previous, selfSelected: '' })); }} /><span>自选商品费率跟随推荐商品</span></label>
-    <p className="admin-help admin-batch-fees-note">关闭跟随后，可单独设置自选费率，也可设为 0%。保存只影响后续新订单，已有订单的代购费率保留。</p>
+    <p className="admin-help admin-batch-fees-note">关闭跟随后，可单独设置自选费率，也可设为 0%。保存新比例后，本期已有订单的代购费和应付金额同步重算。</p>
   </section>;
 }

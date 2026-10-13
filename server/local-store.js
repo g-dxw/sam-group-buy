@@ -171,13 +171,23 @@ export class LocalStore {
         }
       }
       // Capture historical orders before introducing editable retail pricing.
-      // Existing snapshot amounts and export revisions are left unchanged.
+      // Existing product snapshots are left unchanged.
       this.freezeLegacyOrderProducts();
       const savePricing = this.db.prepare('UPDATE products SET original_price_cents=?,pricing_json=? WHERE product_id=?');
       for (const row of this.db.prepare('SELECT * FROM products WHERE pricing_json IS NULL').all()) {
         const source = row.source_json ? JSON.parse(row.source_json) : null;
         savePricing.run(validPrice(source?.priceCents) ? source.priceCents : null,
           JSON.stringify({ mode: 'fixed', markupBps: null }), row.product_id);
+      }
+      // Moving from frozen rates to the current period policy also invalidates
+      // local export receipts. No remote backup runs during this migration.
+      if (this.getMeta('orderBillingPolicyVersion') !== 'current-batch-fees-v1') {
+        for (const batch of this.listBatches({ includeDeleted: true })) {
+          const before = billLines(this.listExportLines(batch.code, { includeDeleted: true })
+            .map(line => ({ ...line, feeRateBps: line.snapshot?.feeRateBps ?? 0 })));
+          this.markBillingChanges(batch.code, before, new Set(), { includeDeleted: true });
+        }
+        this.setMeta('orderBillingPolicyVersion', 'current-batch-fees-v1');
       }
     });
   }
@@ -635,20 +645,24 @@ export class LocalStore {
     });
   }
   updateBatch(code, patch) {
-    const columns = { title: 'title', description: 'description', productIds: 'product_ids_json',
-      collecting: 'collecting', cutoffAt: 'cutoff_at', pickupLocation: 'pickup_location',
-      pickupAt: 'pickup_at', contactNote: 'contact_note', samsStore: 'sams_store_json', feePolicy: 'fee_policy_json', splitRules: 'split_rules_json' };
-    const assignments = [];
-    const values = [];
-    for (const [key, value] of Object.entries(patch)) {
-      if (!columns[key]) throw new DomainError(400, 'INVALID_BATCH_FIELDS', '小区归属与期数不能修改。');
-      assignments.push(`${columns[key]}=?`);
-      values.push(key === 'splitRules' ? JSON.stringify(normalizeSplitRules(value)) : key === 'feePolicy' ? JSON.stringify(normalizeFeePolicy(value))
-        : key === 'productIds' || key === 'samsStore' ? (value === null ? null : JSON.stringify(value)) : key === 'collecting' ? Number(value) : value);
-    }
-    if (!this.getBatch(code)) throw new DomainError(404, 'BATCH_NOT_FOUND', '未找到这个团购。');
-    if (assignments.length) this.db.prepare(`UPDATE batches SET ${assignments.join(',')} WHERE code=?`).run(...values, code);
-    return this.getBatch(code);
+    return this.transaction(() => {
+      const columns = { title: 'title', description: 'description', productIds: 'product_ids_json',
+        collecting: 'collecting', cutoffAt: 'cutoff_at', pickupLocation: 'pickup_location',
+        pickupAt: 'pickup_at', contactNote: 'contact_note', samsStore: 'sams_store_json', feePolicy: 'fee_policy_json', splitRules: 'split_rules_json' };
+      const assignments = [];
+      const values = [];
+      for (const [key, value] of Object.entries(patch)) {
+        if (!columns[key]) throw new DomainError(400, 'INVALID_BATCH_FIELDS', '小区归属与期数不能修改。');
+        assignments.push(`${columns[key]}=?`);
+        values.push(key === 'splitRules' ? JSON.stringify(normalizeSplitRules(value)) : key === 'feePolicy' ? JSON.stringify(normalizeFeePolicy(value))
+          : key === 'productIds' || key === 'samsStore' ? (value === null ? null : JSON.stringify(value)) : key === 'collecting' ? Number(value) : value);
+      }
+      if (!this.getBatch(code)) throw new DomainError(404, 'BATCH_NOT_FOUND', '未找到这个团购。');
+      const before = Object.hasOwn(patch, 'feePolicy') ? this.listExportLines(code) : null;
+      if (assignments.length) this.db.prepare(`UPDATE batches SET ${assignments.join(',')} WHERE code=?`).run(...values, code);
+      if (before) this.markBillingChanges(code, before);
+      return this.getBatch(code);
+    });
   }
   refreshDefaultBatch() {
     if (!this.getBatch(this.getMeta('defaultBatch'))) this.setMeta('defaultBatch', this.listBatches()[0]?.code || null);
@@ -737,17 +751,18 @@ export class LocalStore {
     });
   }
 
-  markBillingChanges(code, before, alreadyChanged = new Set()) {
+  markBillingChanges(code, before, alreadyChanged = new Set(), { includeDeleted = false } = {}) {
     const previous = new Map(before.map(line => [line.lineId, line]));
     const mark = this.db.prepare('UPDATE order_lines SET revision=revision+1,export_error=NULL WHERE batch_code=? AND line_id=?');
-    for (const line of this.listExportLines(code)) {
+    for (const line of this.listExportLines(code, { includeDeleted })) {
       const old = previous.get(line.lineId);
-      if (old && (old.feeCents !== line.feeCents || old.amountCents !== line.amountCents) && !alreadyChanged.has(line.lineId)) mark.run(code, line.lineId);
+      if (old && (old.feeRateBps !== line.feeRateBps || old.feeCents !== line.feeCents || old.amountCents !== line.amountCents)
+        && !alreadyChanged.has(line.lineId)) mark.run(code, line.lineId);
     }
   }
 
-  listExportLines(code, { onlyDirty = false } = {}) {
-    const batch = this.getBatch(code);
+  listExportLines(code, { onlyDirty = false, includeDeleted = false } = {}) {
+    const batch = this.getBatch(code, { includeDeleted });
     if (!batch) throw new DomainError(404, 'BATCH_NOT_FOUND', '未找到这个团购。');
     const products = new Map(this.listProducts({ includeRemoved: true }).map(product => [product.id, product]));
     const lines = this.listOrderLines(code).map(line => {
@@ -766,7 +781,7 @@ export class LocalStore {
       };
     });
     const destinationChanged = onlyDirty && !this.isCommunityOrderDestinationCurrent(code, batch);
-    return billLines(lines).filter(line => !onlyDirty || destinationChanged || line.revision !== line.syncedRevision);
+    return billLines(lines, { feePolicy: batch.feePolicy }).filter(line => !onlyDirty || destinationChanged || line.revision !== line.syncedRevision);
   }
   getSplitSettlement(code, productId) {
     const row = this.db.prepare('SELECT result_json FROM split_settlements WHERE batch_code=? AND product_id=?').get(code, productId);

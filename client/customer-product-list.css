@@ -12,7 +12,7 @@
   cursor: zoom-in;
 }
 .customer-product-list .customer-product-image-button:focus-visible {
-  outline: 3px solid #a6c9b3;
+  outline: 3px solid var(--focus);
   outline-offset: -4px;
   z-index: 1;
 }

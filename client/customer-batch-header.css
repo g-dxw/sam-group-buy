@@ -39,7 +39,7 @@
   gap: 10px;
   margin: 0;
   max-width: 100%;
-  color: var(--green-dark);
+  color: var(--primary-dark);
   font-size: 26px;
   line-height: 1.45;
   letter-spacing: .2px;
@@ -107,7 +107,7 @@
   .customer-batch-header .customer-header-start { gap: 12px; }
   .customer-batch-header .customer-header-context { max-width: none; padding-left: 12px; }
   .customer-batch-header .brand { gap: 9px; }
-  .customer-batch-header .brand-mark { width: 38px; height: 42px; }
+  .customer-batch-header .brand-mark { width: 44px; height: 44px; }
   .hero.customer-batch-overview { padding: 20px; margin-bottom: 24px; border-radius: 16px; }
   .customer-batch-overview .hero-copy { max-width: none; }
   .customer-batch-overview .hero-copy h1 { font-size: 22px; gap: 8px; }

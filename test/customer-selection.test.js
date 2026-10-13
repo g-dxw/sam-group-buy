@@ -81,16 +81,85 @@ test('private quotes and selections bind customer/batch/store and never pollute 
   assert.deepEqual(mockDetailCalls(f)[0].body, { spuIdList: ['111'], visitStoreId: '6505', storeInfoList: [{ storeType: 2, storeId: '6505' }], locationSwitch: false });
 });
 
-test('strict detail identity, true availability, sale price and positive stock are required; safeStockQuantity zero is valid', async t => {
-  for (const patch of [{ spuId: '222' }, { storeId: '6506' }, { storeType: 4 }, { isAvailable: false },
-    { isStoreAvailable: undefined }, { isPutOnSale: null }, { stockInfo: { stockQuantity: 0 } },
-    { stockInfo: { stockQuantity: '5' } }, { stockInfo: null }, { priceInfo: [{ priceType: 2, price: '0' }] }]) {
+test('strict detail identity and a valid sale price remain required', async t => {
+  for (const patch of [{ spuId: '222' }, { storeId: '6506' }, { storeType: 4 },
+    { priceInfo: [{ priceType: 2, price: '0' }] }, { priceInfo: [{ priceType: 1, price: '-1' }] },
+    { priceInfo: [{ priceType: 1, price: '29.80' }] }, { priceInfo: [{ priceType: 1, price: '100000001' }] }]) {
     const f = fixture(t); f.state.detail.set('111', makeRow('111', 2980, patch));
     await assert.rejects(add(f), error => ['SELF_PRODUCT_CHANGED', 'INVALID_SAMS_SELECTION'].includes(error.code));
     assert.equal(f.customer.list(f.batch, token).products.length, 0);
   }
+});
+
+test('upstream sale, store availability and zero or unknown stock do not block a valid priced selection', async t => {
+  for (const patch of [{ isAvailable: false, isStoreAvailable: false, isPutOnSale: false, stockInfo: { stockQuantity: 0 } },
+    { isAvailable: undefined, isStoreAvailable: undefined, isPutOnSale: null, stockInfo: null },
+    { stockInfo: { stockQuantity: '5' } }, { stockInfo: { stockQuantity: -1 } },
+    { stockInfo: { stockQuantity: 0.5 } }, { stockInfo: {} }]) {
+    const f = fixture(t); f.state.rows = [makeRow('111', 2980, patch)];
+    const searched = await f.customer.search(f.batch, token, { keyword: '商品' });
+    const available = typeof patch.isAvailable === 'boolean' ? patch.isAvailable : null;
+    const onSale = typeof patch.isPutOnSale === 'boolean' ? patch.isPutOnSale : null;
+    assert.equal(searched.products[0].selectable, true);
+    assert.equal(searched.products[0].onSale, true);
+    assert.equal(searched.products[0].available, Object.hasOwn(patch, 'isAvailable') ? available : true);
+    assert.equal(searched.products[0].on_sale, Object.hasOwn(patch, 'isPutOnSale') ? onSale : true);
+    const personal = (await f.customer.add(f.batch, token, { selectionId: searched.selectionId, spuId: '111' })).product;
+    assert.equal(personal.selectable, true); assert.equal(personal.onSale, true); assert.equal(personal.priceCents, 2980);
+    assert.equal(personal.available, searched.products[0].available);
+    assert.equal(personal.on_sale, searched.products[0].on_sale);
+  }
+});
+
+test('a later upstream stop and zero stock do not change the quote or prevent exact fee-bearing orders', async t => {
   const f = fixture(t);
-  assert.equal((await add(f)).selectable, true);
+  f.service.updateBatch(f.batch.code, { feePolicy: { recommendedRateBps: 0, selfSelectedRateBps: 200 } });
+  const personal = await add(f);
+  const payload = order(f, [personal], {
+    items: [{ productId: personal.id, quantity: 2, version: personal.version }],
+    feePolicyVersion: f.service.getCatalog(f.batch).batch.feePolicyVersion,
+  });
+  const quoted = f.customer.quote(f.batch, token, { phone: payload.phone, items: payload.items,
+    feePolicyVersion: payload.feePolicyVersion });
+  assert.equal(quoted.goodsTotalCents, 5960); assert.equal(quoted.selfSelectedFeeCents, 119);
+  f.state.detail.set('111', makeRow('111', 2980, {
+    isAvailable: false, isStoreAvailable: false, isPutOnSale: false, stockInfo: { stockQuantity: 0 },
+  }));
+  const result = await f.customer.submit(f.batch, token, { ...payload, feeQuoteVersion: quoted.feeQuoteVersion });
+  assert.equal(result.status, 'completed');
+  const saved = f.store.getCustomerProduct(f.batch.code, customerOwner(token), personal.id).product;
+  assert.equal(saved.version, personal.version);
+  assert.equal(saved.available, false); assert.equal(saved.on_sale, false);
+  assert.equal(saved.onSale, true); assert.equal(saved.selectable, true);
+  const lines = f.store.listExportLines(f.batch.code);
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].quantity, 2); assert.equal(lines[0].priceCents, 2980);
+  assert.equal(lines[0].amountCents, 5960); assert.equal(lines[0].feeRateBps, 200); assert.equal(lines[0].feeCents, 119);
+  assert.equal(f.service.queryOrders(f.batch, payload.phone).totalCents, 6079);
+});
+
+test('saved quotes blocked by upstream flags recover durably while missing-price quotes stay blocked', async t => {
+  for (const priceUnavailable of [false, true]) {
+    const f = fixture(t); const personal = await add(f);
+    const internal = f.store.getCustomerProduct(f.batch.code, customerOwner(token), personal.id);
+    const oldVersion = 'a'.repeat(64);
+    f.store.saveCustomerProduct(f.batch.code, customerOwner(token), internal.storeKey, {
+      ...internal.product, available: false, on_sale: false, onSale: false, selectable: false,
+      version: oldVersion, ...(priceUnavailable ? { priceUnavailable: true } : {}),
+    }, start);
+    const listed = f.customer.list(f.batch, token).products[0];
+    assert.equal(listed.onSale, !priceUnavailable); assert.equal(listed.selectable, !priceUnavailable);
+    assert.equal(listed.available, false); assert.equal(listed.on_sale, false);
+    const saved = f.store.getCustomerProduct(f.batch.code, customerOwner(token), personal.id).product;
+    if (priceUnavailable) {
+      assert.equal(saved.version, oldVersion); assert.equal(saved.priceUnavailable, true);
+    } else {
+      assert.equal(saved.onSale, true); assert.equal(saved.selectable, true);
+      assert.notEqual(saved.version, oldVersion); assert.equal(saved.version, personal.version);
+      assert.equal((await f.customer.submit(f.batch, token, order(f, [listed]))).status, 'completed');
+      assert.equal(f.service.queryOrders(f.batch, '13800138000').totalCents, 2980);
+    }
+  }
 });
 
 test('mixed orders commit one atomic receipt and drafts; all new order prices stay frozen', async t => {

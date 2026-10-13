@@ -84,16 +84,24 @@ test('收费按真实商品明细备份，商品额、费率、分摊费用、�
   assert.ok(api.reads.every(fields => feeFields.every(name => fields.includes(name))));
   assert.ok(api.rows.every(row => row.fields['同步状态'][0] === '已确认'));
   assert.equal((await sync.syncOrders(batch.code)).counts.unchanged, 2);
+  const originalIds = api.rows.map(row => row.record_id);
   store.importProducts(products.map(row => ({ ...row, priceCents: row.priceCents * 2 })));
   store.updateBatch(batch.code, { feePolicy: { recommendedRateBps: 900, selfSelectedRateBps: 800 } });
+  assert.equal(store.listExportLines(batch.code, { onlyDirty: true }).length, 2);
   assert.equal((await sync.syncOrders(batch.code)).status, 'success');
-  assert.equal(api.rows[0].fields['同步应付金额'], 20.2, 'accepted price and rate stay frozen');
+  assert.deepEqual(api.rows.map(row => row.record_id), originalIds);
+  assert.equal(api.rows[0].fields['同步金额'], 20, 'accepted product prices stay frozen');
+  assert.equal(api.rows[0].fields['同步代购费率'], 9);
+  assert.equal(api.rows[0].fields['同步代购费'], 1.8);
+  assert.equal(api.rows[0].fields['同步应付金额'], 21.8);
+  assert.equal(api.rows[1].fields['同步代购费率'], 8);
+  assert.equal(api.rows[1].fields['同步应付金额'], 54);
   store.updateOrder(batch.code, 'fees-submission:P2', { status: '缺货' });
   assert.equal((await sync.syncOrders(batch.code)).status, 'success');
   assert.equal(api.rows[1].fields['同步金额'], 0);
   assert.equal(api.rows[1].fields['同步代购费'], 0);
   assert.equal(api.rows[1].fields['同步应付金额'], 0);
-  assert.equal(api.rows[1].fields['同步代购费率'], 2, 'the agreed rate survives cancellation');
+  assert.equal(api.rows[1].fields['同步代购费率'], 8, 'cancelled lines retain the current period rate with zero fees');
   assert.equal(api.rows.length, 2);
 });
 
@@ -114,8 +122,8 @@ test('缺全部或部分收费字段时，非零费率订单即使费用舍入�
   }
 });
 
-test('旧零费订单表继续备份；补齐收费字段后可在原商品明细补写零费快照', async t => {
-  const { store, batch } = fixture(t, { legacy: true });
+test('旧零费订单表继续备份；补齐收费字段后可在原商品明细补写当前零费规则', async t => {
+  const { store, batch } = fixture(t, { legacy: true, rateBps: 0 });
   const api = remote({ fees: false });
   const sync = syncer(store, api);
   assert.equal((await sync.syncOrders(batch.code)).status, 'success');
@@ -130,6 +138,90 @@ test('旧零费订单表继续备份；补齐收费字段后可在原商品明�
   assert.equal(api.rows[0].fields['同步代购费率'], 0);
   assert.equal(api.rows[0].fields['同步收费类别'], '推荐商品');
   assert.equal(api.rows[0].fields['同步应付金额'], 10);
+});
+
+test('旧零费订单改为收费后要求完整收费字段，补齐后覆写同一记录并保留原价格', async t => {
+  const { store, batch, products } = fixture(t, { legacy: true, rateBps: 0 });
+  const api = remote({ fees: false }); const sync = syncer(store, api);
+  assert.equal((await sync.syncOrders(batch.code)).status, 'success');
+  const originalId = api.rows[0].record_id; const writes = api.writes.length;
+  store.importProducts(products.map(row => ({ ...row, priceCents: 9000 })));
+  store.updateBatch(batch.code, { feePolicy: { recommendedRateBps: 100, selfSelectedRateBps: null } });
+  assert.equal(store.listExportLines(batch.code, { onlyDirty: true }).length, 1);
+  const missingSchema = await sync.syncOrders(batch.code);
+  assert.equal(missingSchema.status, 'error'); assert.equal(missingSchema.error.code, 'EXPORT_FEE_SCHEMA_MISSING');
+  assert.equal(api.writes.length, writes);
+  api.schema.push(...Object.entries(ORDER_FEE_SCHEMA).map(([name, type]) => ({ name, type })));
+  assert.equal((await sync.syncOrders(batch.code)).status, 'success');
+  assert.equal(api.rows.length, 1); assert.equal(api.rows[0].record_id, originalId);
+  assert.equal(api.rows[0].fields['同步单价'], 10); assert.equal(api.rows[0].fields['同步金额'], 10);
+  assert.equal(api.rows[0].fields['同步代购费率'], 1); assert.equal(api.rows[0].fields['同步代购费'], 0.1);
+  assert.equal(api.rows[0].fields['同步应付金额'], 10.1);
+});
+
+test('推荐和自选费率、跟随及零费切换重算旧单，按变更明细覆写原记录且取消行费率也待备份', async t => {
+  const { store, batch, products } = fixture(t, { mixed: true, priceCents: 49 });
+  const api = remote(); const sync = syncer(store, api);
+  assert.equal((await sync.syncOrders(batch.code)).status, 'success');
+  const originalIds = api.rows.map(row => row.record_id);
+  store.importProducts(products.map(row => ({ ...row, priceCents: 99999 })));
+  const scenarios = [
+    [{ recommendedRateBps: 200, selfSelectedRateBps: 300 }, [2, 3], [0.02, 1.5], ['P1', 'P2']],
+    [{ recommendedRateBps: 200, selfSelectedRateBps: null }, [2, 2], [0.02, 1], ['P2']],
+    [{ recommendedRateBps: 500, selfSelectedRateBps: null }, [5, 5], [0.05, 2.5], ['P1', 'P2']],
+    [{ recommendedRateBps: 500, selfSelectedRateBps: 0 }, [5, 0], [0.05, 0], ['P2']],
+    [{ recommendedRateBps: 0, selfSelectedRateBps: 0 }, [0, 0], [0, 0], ['P1']],
+    [{ recommendedRateBps: 0, selfSelectedRateBps: null }, [0, 0], [0, 0], []],
+  ];
+  for (const [feePolicy, rates, fees, changedProducts] of scenarios) {
+    store.updateBatch(batch.code, { feePolicy });
+    assert.deepEqual(store.listExportLines(batch.code, { onlyDirty: true }).map(line => line.productId), changedProducts);
+    assert.equal((await sync.syncOrders(batch.code)).status, 'success');
+    assert.deepEqual(api.rows.map(row => row.record_id), originalIds);
+    assert.deepEqual(api.rows.map(row => row.fields['同步代购费率']), rates);
+    assert.deepEqual(api.rows.map(row => row.fields['同步代购费']), fees);
+    assert.deepEqual(api.rows.map(row => row.fields['同步金额']), [0.98, 50]);
+    assert.deepEqual(api.rows.map(row => row.fields['同步收费类别']), ['推荐商品', '自选商品']);
+    assert.equal(store.listExportLines(batch.code, { onlyDirty: true }).length, 0);
+  }
+  store.updateOrder(batch.code, 'fees-submission:P1', { status: '已取消' });
+  assert.equal((await sync.syncOrders(batch.code)).status, 'success');
+  const cancelledRevision = store.listExportLines(batch.code)[0].revision;
+  store.updateBatch(batch.code, { feePolicy: { recommendedRateBps: 100, selfSelectedRateBps: 200 } });
+  const cancelled = store.listExportLines(batch.code, { onlyDirty: true }).find(line => line.productId === 'P1');
+  assert.ok(cancelled.revision > cancelledRevision);
+  assert.equal(cancelled.amountCents, 0); assert.equal(cancelled.feeCents, 0); assert.equal(cancelled.feeRateBps, 100);
+  assert.equal((await sync.syncOrders(batch.code)).status, 'success');
+  assert.deepEqual(api.rows.map(row => row.record_id), originalIds);
+  assert.equal(api.rows[0].fields['同步代购费率'], 1); assert.equal(api.rows[0].fields['同步应付金额'], 0);
+  assert.equal(api.writes.filter(write => write.command === '+record-batch-create').length, 1);
+});
+
+test('同步途中只改费率且费用仍舍入为零，旧版本确认不会清新待备份并仍复用原记录', async t => {
+  const { store, batch } = fixture(t, { priceCents: 1 });
+  const api = remote(); const call = api.larkCall;
+  let changed = false;
+  api.larkCall = async args => {
+    const result = await call(args);
+    if (!changed && args[1] === '+record-batch-create') {
+      changed = true;
+      store.updateBatch(batch.code, { feePolicy: { recommendedRateBps: 200, selfSelectedRateBps: 200 } });
+    }
+    return result;
+  };
+  const sync = syncer(store, api); const before = store.listExportLines(batch.code)[0];
+  const firstResult = await sync.syncOrders(batch.code);
+  assert.equal(firstResult.status, 'pending'); assert.equal(firstResult.counts.pending, 1);
+  const latest = store.listExportLines(batch.code)[0]; const recordId = api.rows[0].record_id;
+  assert.ok(latest.revision > before.revision); assert.ok(latest.syncedRevision < latest.revision);
+  assert.equal(latest.remoteRecordId, recordId); assert.equal(latest.feeRateBps, 200); assert.equal(latest.feeCents, 0);
+  assert.equal(api.rows[0].fields['同步代购费率'], 1); assert.equal(api.rows[0].fields['同步代购费'], 0);
+  assert.equal(api.rows[0].fields['数据版本'], before.revision);
+  assert.equal((await sync.syncOrders(batch.code)).status, 'success');
+  assert.equal(api.rows.length, 1); assert.equal(api.rows[0].record_id, recordId);
+  assert.equal(api.rows[0].fields['同步代购费率'], 2); assert.equal(api.rows[0].fields['同步代购费'], 0);
+  assert.equal(api.rows[0].fields['数据版本'], latest.revision);
+  assert.equal(store.listExportLines(batch.code, { onlyDirty: true }).length, 0);
 });
 
 test('收费字段读回丢失或被更改时，保持待确认且不清除本地待备份状态', async t => {

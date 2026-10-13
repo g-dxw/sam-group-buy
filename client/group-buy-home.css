@@ -20,16 +20,16 @@
   position: relative;
   margin-bottom: 28px;
   padding: 32px 36px;
-  border: 1px solid #e1e9db;
+  border: 1px solid var(--border);
   border-radius: 18px;
-  background: #eff3e9;
+  background: var(--primary-soft);
 }
 
 .group-buy-home-eyebrow {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  color: var(--green-dark);
+  color: var(--primary-dark);
   font-size: 13px;
 }
 
@@ -51,7 +51,7 @@
   position: absolute;
   right: 36px;
   bottom: 34px;
-  color: var(--green);
+  color: var(--primary);
   font-size: 13px;
   font-weight: 600;
 }
@@ -88,7 +88,7 @@
   align-items: flex-start;
   gap: 7px;
   min-width: 0;
-  color: var(--green-dark);
+  color: var(--primary-dark);
   font-size: 13px;
   font-weight: 600;
   line-height: 1.7;
@@ -106,8 +106,8 @@
   gap: 5px;
   padding: 3px 8px;
   border-radius: 6px;
-  background: #edf5ee;
-  color: var(--green);
+  background: var(--primary-soft);
+  color: var(--primary);
   font-size: 12px;
   line-height: 1.5;
 }
@@ -160,9 +160,9 @@
 .group-buy-cover > div {
   min-width: 0;
   overflow: hidden;
-  border: 1px solid #edf0e8;
+  border: 1px solid var(--border);
   border-radius: 10px;
-  background: #fafbf8;
+  background: #f7fafd;
 }
 
 .group-buy-cover img {
@@ -178,7 +178,7 @@
   justify-content: center;
   flex-direction: column;
   gap: 10px;
-  color: #6b886b;
+  color: var(--muted);
   font-size: 12px;
 }
 
@@ -255,7 +255,7 @@
 
 .group-buy-home-empty {
   padding: 48px 24px;
-  border: 1px dashed #d9e2d3;
+  border: 1px dashed var(--border);
   border-radius: 16px;
   background: #fff;
   text-align: center;
@@ -268,8 +268,8 @@
   height: 66px;
   margin: 0 auto 18px;
   border-radius: 50%;
-  background: var(--cream);
-  color: var(--green);
+  background: var(--primary-soft);
+  color: var(--primary);
 }
 
 .group-buy-home-empty h2 {
@@ -307,7 +307,7 @@
   min-height: 44px;
   margin: -8px 0 14px;
   padding: 8px 4px;
-  color: var(--green);
+  color: var(--primary);
   font-size: 13px;
   font-weight: 500;
   text-decoration: none;
@@ -323,7 +323,7 @@
 
 .group-buy-home a:focus-visible,
 .batch-all-link:focus-visible {
-  outline: 3px solid #8fbba2;
+  outline: 3px solid var(--focus);
   outline-offset: 4px;
 }
 
