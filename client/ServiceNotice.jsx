@@ -1,11 +1,14 @@
 import './service-notice.css';
 
-export function ServiceNotice() {
-  return <aside className="customer-service-notice" aria-label="代购服务说明">
-    <strong>到货后付款 · 本网页只登记订单，不在线收款</strong>
-    <p>代购由本期活动组织者安排。本网页非山姆官方商城，与山姆官方无隶属关系。</p>
-    <nav className="customer-service-links" aria-label="服务与隐私说明"><a href="/service.html">代购服务说明</a><a href="/privacy.html">隐私说明</a></nav>
-  </aside>;
+export function ServiceFooter({ children }) {
+  return <footer className="customer-service-footer" aria-label="代购服务说明">
+    <div className="customer-footer-summary">{children}</div>
+    <div className="customer-service-notice">
+      <strong>到货后付款 · 本网页只登记订单，不在线收款</strong>
+      <p>代购由本期活动组织者安排。本网页非山姆官方商城，与山姆官方无隶属关系。</p>
+      <nav className="customer-service-links" aria-label="服务与隐私说明"><a href="/service.html">代购服务说明</a><a href="/privacy.html">隐私说明</a></nav>
+    </div>
+  </footer>;
 }
 
 export function OrderDataNotice() {
