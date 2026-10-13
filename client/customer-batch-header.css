@@ -1,19 +1,102 @@
-.hero .hero-copy { min-width: 0; }
-.hero .hero-copy h1 { font-size: 26px; word-break: keep-all; overflow-wrap: anywhere; }
-.hero .eyebrow { font-size: 16px; font-weight: 600; }
-.hero .cutoff { font-size: 16px; font-weight: 400; }
-
-@media (min-width: 1440px) {
-  .hero .hero-copy h1 { font-size: 28px; }
+.customer-batch-header .customer-header-start {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  min-width: 0;
+  gap: 22px;
 }
+.customer-batch-header .brand { flex-shrink: 0; }
+.customer-batch-header .customer-header-context {
+  min-width: 0;
+  max-width: 340px;
+  padding-left: 22px;
+  border-left: 1px solid var(--border);
+}
+.customer-header-context strong {
+  display: block;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.6;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+.customer-header-context small { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.customer-batch-header nav { flex-shrink: 0; }
+
+.hero.customer-batch-overview {
+  min-height: 0;
+  align-items: center;
+  padding: 28px 30px;
+  margin-bottom: 28px;
+  gap: 30px;
+}
+.customer-batch-overview .hero-copy { flex: 1; min-width: 0; max-width: 760px; }
+.customer-overview-status-row { display: flex; align-items: center; flex-wrap: wrap; gap: 12px 18px; }
+.customer-batch-overview .hero-copy h1 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  max-width: 100%;
+  color: var(--green-dark);
+  font-size: 26px;
+  line-height: 1.45;
+  letter-spacing: .2px;
+}
+.customer-batch-overview .status-dot { width: 8px; height: 8px; flex: 0 0 8px; }
+.customer-batch-overview .cutoff {
+  margin: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #ffffff99;
+  font-size: 16px;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.customer-batch-overview .hero-copy > p { max-width: 100%; margin-top: 12px; padding-right: 0; font-size: 16px; line-height: 1.8; }
+.customer-batch-overview .customer-fee-policy {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 6px 14px;
+  margin: 18px 0 0;
+  padding: 14px 16px;
+  background: #ffffffbb;
+  font-size: 14px;
+}
+.customer-batch-overview .customer-fee-policy > span { min-width: 0; font-size: 16px; }
+.customer-batch-overview .customer-fee-policy > small { grid-column: 1 / -1; font-size: 13px; }
+.customer-batch-overview .hero-art { position: static; flex: 0 0 180px; width: 180px; margin-top: 0; opacity: 1; }
+.customer-batch-overview .hero-art svg { width: 180px; }
+.customer-batch-pickup { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 12px; color: var(--muted); font-size: 14px; line-height: 1.7; }
+.customer-batch-pickup > span { flex-shrink: 0; }
+.customer-batch-pickup > div { display: flex; flex-wrap: wrap; min-width: 0; gap: 4px 12px; color: var(--text); overflow-wrap: anywhere; }
+.customer-batch-summary { margin-bottom: 24px; }
+.customer-batch-summary .customer-fee-policy { margin: 0; }
+
 @media (max-width: 800px) {
-  .hero .hero-copy h1 { font-size: 24px; }
+  .header-inner.customer-batch-header { flex-wrap: wrap; gap: 12px; }
+  .customer-batch-header .customer-header-start { width: 100%; flex: auto; }
+  .header-inner.customer-batch-header nav { display: grid; width: 100%; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+  .customer-batch-header nav button { justify-content: center; }
+  .hero.customer-batch-overview { gap: 20px; padding: 24px; }
+  .customer-batch-overview .hero-art { flex-basis: 140px; width: 140px; }
+  .customer-batch-overview .hero-art svg { width: 140px; }
+  .customer-batch-overview .hero-copy h1 { font-size: 24px; }
 }
 @media (max-width: 580px) {
-  .hero .hero-copy h1 { font-size: 22px; max-width: 100%; }
-}
-@media (max-width: 360px) {
-  .hero .hero-art { display: none; }
-  .hero .hero-copy > p { padding-right: 0; max-width: 100%; }
-  .hero .hero-notes { max-width: 100%; }
+  .customer-batch-header .customer-header-start { gap: 12px; }
+  .customer-batch-header .customer-header-context { max-width: none; padding-left: 12px; }
+  .customer-header-context strong { font-size: 13px; }
+  .customer-batch-header .brand { gap: 9px; }
+  .customer-batch-header .brand-mark { width: 38px; height: 42px; }
+  .hero.customer-batch-overview { padding: 20px; margin-bottom: 24px; border-radius: 16px; }
+  .customer-batch-overview .hero-copy { max-width: none; }
+  .customer-batch-overview .hero-copy h1 { font-size: 22px; gap: 8px; }
+  .customer-overview-status-row { gap: 10px; }
+  .customer-batch-overview .cutoff { padding: 5px 8px; font-size: 14px; }
+  .customer-batch-overview .hero-art { display: none; }
+  .customer-batch-overview .customer-fee-policy { padding: 12px 14px; gap: 6px 12px; }
 }

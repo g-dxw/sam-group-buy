@@ -10,6 +10,7 @@ import { CUSTOMER_CONTACT_KEY, readCustomerContact, saveCustomerContact, clearCu
 import './customer-product-list.css';
 import './customer-contact.css';
 import './customer-batch-header.css';
+import BatchPickupInfo, { formatBatchTime } from './BatchPickupInfo.jsx';
 import { ServiceFooter, OrderDataNotice } from './ServiceNotice.jsx';
 
 const money = cents => `¥${((cents || 0) / 100).toFixed(2)}`;
@@ -614,23 +615,39 @@ export default function App() {
   }
 
   const batch = catalog?.batch;
-  const cutoffText = batch?.cutoffAt ? new Date(batch.cutoffAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Shanghai' }) : null;
+  const cutoffText = formatBatchTime(batch?.cutoffAt);
+  const groupContext = [batch?.communityName, batch?.periodLabel].filter(Boolean).join(' · ');
+  const activityTitle = batch?.title || groupContext;
 
   return <>
-    <header className="site-header"><div className="header-inner">
-      <button className="brand" type="button" onClick={() => navigate('products')} aria-label="返回商品列表"><span className="brand-mark"><Icon name="bag" size={22} /></span><span>一起逛山姆<small>本期代购收集</small></span></button>
+    <header className="site-header"><div className="header-inner customer-batch-header">
+      <div className="customer-header-start">
+        <button className="brand" type="button" onClick={() => navigate('products')} aria-label="返回商品列表"><span className="brand-mark"><Icon name="bag" size={22} /></span><span>一起逛山姆<small>本期代购收集</small></span></button>
+        {activityTitle && <div className="customer-header-context"><strong>{activityTitle}</strong>{groupContext && activityTitle !== groupContext && <small>{groupContext}</small>}</div>}
+      </div>
       <nav aria-label="主要导航"><button className={view === 'products' ? 'nav-active' : ''} onClick={() => navigate('products')}><Icon name="leaf" /><span>选商品</span></button><button className={view === 'cart' ? 'nav-active' : ''} onClick={() => navigate('cart')}><Icon name="bag" /><span>购物车</span>{itemCount > 0 && <b className="count-badge">{itemCount}</b>}</button><button className={view === 'query' ? 'nav-active' : ''} onClick={() => navigate('query')}><Icon name="list" /><span>查订单</span></button></nav>
     </div></header>
     <main className="page-shell">
       <a className="batch-all-link" href="/"><Icon name="arrow" size={16} />全部团购</a>
-      {batch?.communityName && <div className="batch-context"><strong>{batch.communityName} · {batch.periodLabel}</strong><span>下单自动归入本小区、本期</span>{batch.pickupLocation && <small>取货地点：{batch.pickupLocation}{batch.pickupAt && ` · ${new Date(batch.pickupAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Shanghai' })}`}</small>}</div>}
-      {batch && <FeePolicyNotice policy={batch.feePolicy} />}
+
+      {batch && view !== 'products' && <aside className="customer-batch-summary" aria-label="本期代购与取货说明"><FeePolicyNotice policy={batch.feePolicy} /><BatchPickupInfo batch={batch} /></aside>}
       {catalogState === 'loading' && !catalog ? <div className="loading-panel" role="status"><span className="spinner" />正在准备本期商品…</div> : catalogState === 'ended' ? <EmptyState icon="clock" title="本期收集已结束" description={catalogError || '本期表格已移除，请联系代购获取新一期链接。'} /> : catalogState === 'error' && !catalog ? <EmptyState icon="info" title="暂时无法打开本期商品" description={catalogError}><button className="button primary" onClick={() => loadCatalog().catch(() => {})}>重新加载</button></EmptyState> : <>
         {catalogState === 'error' && <div className="notice error" role="alert"><Icon name="info" /><span>{catalogError} 当前暂时无法下单。</span><button onClick={() => loadCatalog({ silent: true }).catch(() => {})}>重试</button></div>}
         {(customerError || identity.error) && <div className="notice error customer-recovery-notice" role="alert"><Icon name="info" /><span>{identity.error || customerError} 已有购物车会保留。</span><button type="button" onClick={retryPersonalProducts}>恢复个人清单</button></div>}
         {hasPersonalItems && customerState === 'loading' && <div className="notice" role="status"><span className="spinner" /><span>正在恢复你的自选清单，购物车数量会保留。</span></div>}
         {view === 'products' && <>
-          <section className="hero"><div className="hero-copy"><div className="eyebrow"><span className={`status-dot ${collecting ? '' : 'closed'}`} />{collecting ? '本期正在收集' : '本期已截单'}{cutoffText && <span className="cutoff"><Icon name="clock" size={14} />{cutoffText} 截单</span>}</div><h1>{batch?.title || '把喜欢的，<br />一起带回家。'}</h1><p>{batch?.description || '选好商品，填上手机号，我们按清单帮你采购。'}</p><div className="hero-notes"><span><Icon name="check" size={15} />固定规格，按份选购</span><span><Icon name="check" size={15} />手机号查询本期订单</span></div></div><div className="hero-art" aria-hidden="true"><svg viewBox="0 0 280 225"><circle cx="145" cy="109" r="97" fill="#e5eddb"/><ellipse cx="142" cy="201" rx="97" ry="9" fill="#d7dfce"/><path d="m68 88 145-6-17 114H87Z" fill="#c89357"/><path d="M89 89c0-65 104-71 102-5" fill="none" stroke="#9c733f" strokeWidth="9"/><path d="m93 61 24 8-17 70-24-8Z" fill="#f8e8c7"/><path d="m100 52 19 6-1 18-24-8Z" fill="#348268"/><rect x="145" y="54" width="36" height="86" rx="18" fill="#d29642" transform="rotate(20 163 97)"/><path d="m158 76 14 5m-19 12 14 5m-19 12 14 5" stroke="#bd7c2c" strokeWidth="3"/><path d="M181 105c-9-20-1-33 11-31 0-13 17-20 23-7 17-4 25 12 14 23 15 9 2 28-12 21Z" fill="#477d47"/><path d="m187 145 17-48" stroke="#7eaa62" strokeWidth="9"/><path d="m68 88 145-6-17 114H87Z" fill="#e4b47c"/><path d="M101 148h71" stroke="#bd8b56" strokeWidth="1.5"/><path d="M139 166c-17-7-20-18-11-25 10 1 17 11 11 25Zm0 0c2-21 10-28 20-22 1 11-8 20-20 22Z" fill="#557854"/><path d="M139 166v12" stroke="#557854" strokeWidth="2"/><circle cx="50" cy="62" r="4" fill="#d7a569"/><path d="m231 42 5 4m-5 0 5-4" stroke="#729364" strokeWidth="2"/><circle cx="232" cy="156" r="5" fill="#abc69d"/></svg><span>好物一起买 · 生活慢慢选</span></div></section>
+          <section className="hero customer-batch-overview" aria-label="本期活动与代购费">
+            <div className="hero-copy">
+              <div className="customer-overview-status-row">
+                <h1><span className={`status-dot ${collecting ? '' : 'closed'}`} />{collecting ? '本期正在收集' : '本期已截单'}</h1>
+                {cutoffText && <span className="cutoff"><Icon name="clock" size={16} /><time dateTime={batch.cutoffAt}>{cutoffText} 截单</time></span>}
+              </div>
+              <p>{batch?.description || '选好商品，填上手机号，我们按清单帮你采购。'}</p>
+              {batch && <FeePolicyNotice policy={batch.feePolicy} />}
+              <BatchPickupInfo batch={batch} />
+            </div>
+            <div className="hero-art" aria-hidden="true"><svg viewBox="0 0 280 225"><circle cx="145" cy="109" r="97" fill="#e5eddb"/><ellipse cx="142" cy="201" rx="97" ry="9" fill="#d7dfce"/><path d="m68 88 145-6-17 114H87Z" fill="#c89357"/><path d="M89 89c0-65 104-71 102-5" fill="none" stroke="#9c733f" strokeWidth="9"/><path d="m93 61 24 8-17 70-24-8Z" fill="#f8e8c7"/><path d="m100 52 19 6-1 18-24-8Z" fill="#348268"/><rect x="145" y="54" width="36" height="86" rx="18" fill="#d29642" transform="rotate(20 163 97)"/><path d="m158 76 14 5m-19 12 14 5m-19 12 14 5" stroke="#bd7c2c" strokeWidth="3"/><path d="M181 105c-9-20-1-33 11-31 0-13 17-20 23-7 17-4 25 12 14 23 15 9 2 28-12 21Z" fill="#477d47"/><path d="m187 145 17-48" stroke="#7eaa62" strokeWidth="9"/><path d="m68 88 145-6-17 114H87Z" fill="#e4b47c"/><path d="M101 148h71" stroke="#bd8b56" strokeWidth="1.5"/><path d="M139 166c-17-7-20-18-11-25 10 1 17 11 11 25Zm0 0c2-21 10-28 20-22 1 11-8 20-20 22Z" fill="#557854"/><path d="M139 166v12" stroke="#557854" strokeWidth="2"/><circle cx="50" cy="62" r="4" fill="#d7a569"/><path d="m231 42 5 4m-5 0 5-4" stroke="#729364" strokeWidth="2"/><circle cx="232" cy="156" r="5" fill="#abc69d"/></svg><span>好物一起买 · 生活慢慢选</span></div>
+          </section>
           {!collecting && <div className="notice"><Icon name="info" /><span>本期已停止收集，你仍可以查看商品和查询自己的订单。</span></div>}
           <section className="catalog-section" aria-label="商品列表"><div className="section-heading"><div><span className="overline">THIS WEEK’S PICKS</span><h2>本期好物 <span>{products.length} 件商品</span></h2></div><label className="search-field"><Icon name="search" size={19} /><input type="search" data-product-image-focus-fallback aria-label="搜索商品" placeholder="搜索商品名称、规格" ref={searchInputRef} defaultValue={search} onChange={updateSearch} onInput={updateSearch} onCompositionEnd={updateSearch} onBlur={updateSearch} />{search && <button aria-label="清空搜索" type="button" onClick={clearSearch}><Icon name="close" size={15} /></button>}</label></div>
             {shownProducts.length ? <WindowedProductList className="customer-product-list" ariaLabel="本期推荐商品" items={shownProducts} getKey={product => product.id} resetKey={`${code}:recommended:${search}`} renderItem={product => <CustomerProductCard feePolicy={catalog?.batch.feePolicy} product={product} quantity={cart[product.id] || 0} disabled={!collecting || working} onPreviewImage={setPreviewImage} onChange={quantity => updateQuantity(product.id, quantity)} />} /> : <EmptyState icon="search" title="本期推荐中没有找到" description="可以换个关键词，也可以搜索山姆商品加入自己的清单。"><div className="customer-empty-actions"><button type="button" className="button secondary" onClick={clearSearch}>查看全部商品</button><button type="button" className="button primary" onClick={() => openSamsSearch()} disabled={!collecting || working}>去山姆搜索{search ? `“${search}”` : '商品'}</button></div></EmptyState>}
