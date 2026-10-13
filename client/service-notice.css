@@ -10,6 +10,7 @@
 }
 .customer-footer-summary { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px 24px; margin-bottom: 14px; }
 .customer-footer-summary > span { display: inline-flex; align-items: center; gap: 6px; }
+.customer-service-notice { font-size: 13px; }
 .customer-service-notice strong { color: var(--green-dark); font-weight: 600; }
 .customer-service-notice p { margin-top: 3px; color: var(--muted); }
 .customer-service-links { display: flex; flex-wrap: wrap; justify-content: center; gap: 4px 20px; margin-top: 5px; }
@@ -18,6 +19,7 @@
 .customer-order-data-notice p + p { margin-top: 6px; }
 .customer-order-data-notice a { color: var(--green); text-underline-offset: 3px; }
 @media (max-width: 580px) {
+  .customer-service-notice { font-size: 12px; }
   .customer-service-footer { margin-top: 26px; padding-top: 18px; }
   .page-shell > .customer-service-footer { padding-bottom: env(safe-area-inset-bottom, 0px); }
   .customer-footer-summary { flex-direction: column; gap: 6px; }

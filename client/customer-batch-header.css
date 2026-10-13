@@ -16,7 +16,7 @@
   display: block;
   color: var(--text);
   font-size: 14px;
-  font-weight: 600;
+  font-weight: 400;
   line-height: 1.6;
   word-break: keep-all;
   overflow-wrap: anywhere;
@@ -62,8 +62,10 @@
   grid-template-columns: max-content minmax(0, 1fr);
   gap: 6px 14px;
   margin: 18px 0 0;
-  padding: 14px 16px;
-  background: #ffffffbb;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
   font-size: 14px;
 }
 .customer-batch-overview .customer-fee-policy > span { min-width: 0; font-size: 16px; }
@@ -73,8 +75,20 @@
 .customer-batch-pickup { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 12px; color: var(--muted); font-size: 14px; line-height: 1.7; }
 .customer-batch-pickup > span { flex-shrink: 0; }
 .customer-batch-pickup > div { display: flex; flex-wrap: wrap; min-width: 0; gap: 4px 12px; color: var(--text); overflow-wrap: anywhere; }
-.customer-batch-summary { margin-bottom: 24px; }
-.customer-batch-summary .customer-fee-policy { margin: 0; }
+.customer-batch-summary {
+  margin-bottom: 24px;
+  padding: 14px 18px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #fff;
+}
+.customer-batch-summary .customer-fee-policy {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
 
 @media (max-width: 800px) {
   .header-inner.customer-batch-header { flex-wrap: wrap; gap: 12px; }
@@ -86,10 +100,12 @@
   .customer-batch-overview .hero-art svg { width: 140px; }
   .customer-batch-overview .hero-copy h1 { font-size: 24px; }
 }
+@media (max-width: 600px) {
+  .customer-batch-summary { padding: 12px 14px; }
+}
 @media (max-width: 580px) {
   .customer-batch-header .customer-header-start { gap: 12px; }
   .customer-batch-header .customer-header-context { max-width: none; padding-left: 12px; }
-  .customer-header-context strong { font-size: 13px; }
   .customer-batch-header .brand { gap: 9px; }
   .customer-batch-header .brand-mark { width: 38px; height: 42px; }
   .hero.customer-batch-overview { padding: 20px; margin-bottom: 24px; border-radius: 16px; }
@@ -98,5 +114,5 @@
   .customer-overview-status-row { gap: 10px; }
   .customer-batch-overview .cutoff { padding: 5px 8px; font-size: 14px; }
   .customer-batch-overview .hero-art { display: none; }
-  .customer-batch-overview .customer-fee-policy { padding: 12px 14px; gap: 6px 12px; }
+  .customer-batch-overview .customer-fee-policy { gap: 6px 12px; }
 }

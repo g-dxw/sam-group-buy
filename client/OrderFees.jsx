@@ -4,12 +4,12 @@ export const percent = rateBps => `${Number(rateBps || 0) / 100}%`;
 const money = cents => cents == null ? '待确认' : `¥${(cents / 100).toFixed(2)}`;
 const feeName = category => category === 'selfSelected' ? '自选商品代购费' : '推荐商品代购费';
 
-export function FeePolicyNotice({ policy }) {
+export function FeePolicyNotice({ policy, showExplanation = true }) {
   const recommended = policy?.recommendedRateBps || 0;
   const personal = policy?.selfSelectedRateBps ?? recommended;
   return <div className="customer-fee-policy">
     <strong>本期代购费</strong><span>推荐商品 {percent(recommended)} · 自选商品 {percent(personal)}</span>
-    <small>{recommended || personal ? '按商品金额另计，提交前可核对费用明细。' : '本期免代购费。'}</small>
+    {showExplanation && <small>{recommended || personal ? '按商品金额另计，提交前可核对费用明细。' : '本期免代购费。'}</small>}
   </div>;
 }
 
