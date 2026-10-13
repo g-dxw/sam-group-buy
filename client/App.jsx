@@ -9,6 +9,7 @@ import ProductImageViewer from './ProductImageViewer.jsx';
 import { CUSTOMER_CONTACT_KEY, readCustomerContact, saveCustomerContact, clearCustomerContact, initialCustomerForm } from './customer-contact.js';
 import './customer-product-list.css';
 import './customer-contact.css';
+import './customer-batch-header.css';
 import { ServiceFooter, OrderDataNotice } from './ServiceNotice.jsx';
 
 const money = cents => `¥${((cents || 0) / 100).toFixed(2)}`;

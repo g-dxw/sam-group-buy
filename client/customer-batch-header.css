@@ -1,0 +1,19 @@
+.hero .hero-copy { min-width: 0; }
+.hero .hero-copy h1 { font-size: 26px; word-break: keep-all; overflow-wrap: anywhere; }
+.hero .eyebrow { font-size: 16px; font-weight: 600; }
+.hero .cutoff { font-size: 16px; font-weight: 400; }
+
+@media (min-width: 1440px) {
+  .hero .hero-copy h1 { font-size: 28px; }
+}
+@media (max-width: 800px) {
+  .hero .hero-copy h1 { font-size: 24px; }
+}
+@media (max-width: 580px) {
+  .hero .hero-copy h1 { font-size: 22px; max-width: 100%; }
+}
+@media (max-width: 360px) {
+  .hero .hero-art { display: none; }
+  .hero .hero-copy > p { padding-right: 0; max-width: 100%; }
+  .hero .hero-notes { max-width: 100%; }
+}
