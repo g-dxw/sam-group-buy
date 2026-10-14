@@ -99,20 +99,24 @@ test('mixed fees use trusted prices and saved categories, apply current rates, k
   assert.throws(() => f.service.submit(f.batch, { ...input, name: '不同人' }, { ownerHash: customerOwner(f.token) }), { code: 'SUBMISSION_CONFLICT' });
 });
 
-test('quotes are read-only, isolate private products and permit expired trusted estimates while enforcing changed price and ownership', t => {
+test('quotes are read-only and saved personal prices remain usable after elapsed time while price and ownership checks still apply', t => {
   const f = fixture(t); const personal = addPersonal(f); const input = body(f, [personal]);
   const before = JSON.stringify(f.store.listCustomerProducts(f.batch.code, customerOwner(f.token)));
   const changes = f.store.db.prepare('SELECT total_changes() AS n').get().n;
-  assert.equal(f.customer.quote(f.batch, f.token, quoteBody(input)).quoteExpired, false);
+  const originalQuote = f.customer.quote(f.batch, f.token, quoteBody(input));
+  assert.equal(originalQuote.quoteExpired, false);
   assert.throws(() => f.customer.quote(f.batch, randomUUID(), quoteBody(input)), { code: 'SELF_PRODUCT_CHANGED' });
   assert.throws(() => f.customer.quote(f.batch, null, quoteBody(input)), { code: 'CUSTOMER_TOKEN_REQUIRED' });
   assert.throws(() => f.customer.quote(f.batch, f.token, { ...quoteBody(input), priceCents: 1 }), { code: 'INVALID_QUOTE' });
   assert.throws(() => f.customer.quote(f.batch, f.token, { ...quoteBody(input), phone: 'bad' }), { code: 'INVALID_PHONE' });
   f.advance(31 * 60000);
-  assert.equal(f.customer.quote(f.batch, f.token, quoteBody(input)).quoteExpired, true);
+  const currentQuote = f.customer.quote(f.batch, f.token, quoteBody(input));
+  assert.equal(currentQuote.quoteExpired, false); assert.equal(currentQuote.feeQuoteVersion, originalQuote.feeQuoteVersion);
+  assert.equal(currentQuote.totalCents, originalQuote.totalCents);
   assert.equal(JSON.stringify(f.store.listCustomerProducts(f.batch.code, customerOwner(f.token))), before);
   assert.equal(f.store.db.prepare('SELECT total_changes() AS n').get().n, changes);
-  assert.throws(() => f.service.submit(f.batch, input, { customerProducts: new Map([[personal.id, personal]]), ownerHash: customerOwner(f.token) }), { code: 'SELF_PRODUCT_CHANGED' });
+  assert.equal(f.service.submit(f.batch, input, { customerProducts: new Map([[personal.id, personal]]), ownerHash: customerOwner(f.token) }).status, 'completed');
+  assert.equal(f.store.listOrderLines(f.batch.code)[0].snapshot.priceCents, personal.priceCents);
   const ordinary = body(f);
   f.service.updateProduct('regular', { priceCents: 3000 });
   assert.throws(() => f.customer.quote(f.batch, null, quoteBody(ordinary)), { code: 'PRODUCT_CHANGED' });

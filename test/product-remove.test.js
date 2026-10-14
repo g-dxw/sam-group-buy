@@ -176,7 +176,7 @@ test('fresh private purchase uses current upstream price after removal without o
   assert.equal(f.service.getCatalog(f.batch).products.some(p => p.id === first.id), false);
 });
 
-test('removed period split blocks fresh same-SPU personal aliases before and after settlement and never points at a hidden recommendation', async t => {
+test('removing a portion recommendation before or after settlement leaves its independent whole-pack query purchasable', async t => {
   for (const settled of [false, true]) {
     const f = fixture(t, { products: [products[1]] }); const token = randomUUID();
     // A private alias quoted before the administrator recommends this source SKU.
@@ -190,13 +190,21 @@ test('removed period split blocks fresh same-SPU personal aliases before and aft
     if (settled) { f.service.updateBatch(f.batch.code, { collecting: false }); f.service.confirmSplit(f.batch.code, 'sam_111', { remainderPolicy: 'topUp' }); f.service.updateBatch(f.batch.code, { collecting: true }); }
     f.service.removeProduct('sam_111');
     const items = [{ productId: alias.id, quantity: 1, version: alias.version }];
-    assert.throws(() => f.customer.quote(f.batch, token, { phone: '13900139000', items }), error => error.code === 'SPLIT_PRODUCT_REMOVED' && error.details.recommendedProductId === undefined);
-    await assert.rejects(f.customer.submit(f.batch, token, { submissionId: randomUUID(), name: '顾客', phone: '13900139000', items }), { code: 'SPLIT_PRODUCT_REMOVED' });
+    const quote = f.customer.quote(f.batch, token, { phone: '13900139000', items });
+    assert.equal(quote.goodsTotalCents, 12000); assert.equal(quote.pendingSplit, false);
+    await f.customer.submit(f.batch, token, { submissionId: randomUUID(), name: '顾客', phone: '13900139000', items,
+      feePolicyVersion: quote.feePolicyVersion, feeQuoteVersion: quote.feeQuoteVersion });
     const searched = await f.customer.search(f.batch, token, { keyword: '商品' });
-    assert.equal(searched.products[0].selectable, false); assert.match(searched.products[0].selectionUnavailableReason, /拼份商品已移除/);
-    await assert.rejects(f.customer.add(f.batch, token, { selectionId: searched.selectionId, spuId: '111' }), { code: 'SPLIT_PRODUCT_REMOVED' });
-    assert.equal(f.customer.list(f.batch, token).products[0].selectable, false);
-    assert.equal(f.store.listOrderLines(f.batch.code).length, 1);
+    assert.equal(searched.products[0].selectable, true); assert.equal(searched.products[0].id, alias.id);
+    assert.equal(searched.products[0].priceCents, 12000); assert.equal(searched.products[0].purchaseIdentity.kind, 'whole');
+    const added = (await f.customer.add(f.batch, token, { selectionId: searched.selectionId, spuId: '111' })).product;
+    assert.equal(added.split, undefined); assert.equal(added.priceCents, 12000);
+    assert.equal(f.customer.list(f.batch, token).products[0].selectable, true);
+    const lines = f.store.listOrderLines(f.batch.code);
+    assert.equal(lines.length, 2); assert.equal(lines.find(line => line.productId === alias.id).snapshot.split, undefined);
+    assert.equal(lines.find(line => line.productId === 'sam_111').snapshot.priceCents, 5500);
+    assert.throws(() => f.service.quote(f.batch, { phone: '13900139000', items: [{ productId: split.id, quantity: 1, version: split.version }] }),
+      error => ['SPLIT_PRODUCT_REMOVED', 'PRODUCT_CHANGED', 'SPLIT_SETTLED'].includes(error.code));
   }
 });
 

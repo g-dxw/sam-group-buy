@@ -145,6 +145,8 @@ export class LocalService {
       .filter(product => allProducts || selected.has(product.id)).map(product => {
         const view = productView(product, batch);
         const rule = batch.splitRules?.[product.id];
+        const purchaseIdentity = this.purchaseIdentity(product, rule ? 'portion' : 'whole');
+        if (purchaseIdentity) view.purchaseIdentity = purchaseIdentity;
         if (!rule) return view;
         const settlement = this.store.getSplitSettlement(batch.code, product.id);
         const lines = this.store.listOrderLines(batch.code).filter(line => line.productId === product.id && line.snapshot?.split);
@@ -152,6 +154,21 @@ export class LocalService {
           onSale: product.onSale && !settlement, version: splitVersion(view.version, rule, settlement),
           split: { ...publicSplit(packSnapshot(product, rule)), progress: splitProgress(rule, lines, settlement) } };
       }) };
+  }
+  purchaseIdentity(product, kind = 'whole') {
+    const source = product?.source;
+    const spuId = product?.spuId || source?.spuId;
+    if (source?.platform !== 'samsclub_cn' || typeof spuId !== 'string' || !/^[A-Za-z0-9_-]{1,120}$/.test(spuId)
+      || typeof source.storeId !== 'string' || !/^\d{1,12}$/.test(source.storeId)
+      || ![2, 4, 8, 256].includes(source.storeType) || !['whole', 'portion'].includes(kind)) return null;
+    return { platform: 'samsclub_cn', storeType: source.storeType, storeId: source.storeId, spuId, kind };
+  }
+  isPortionProduct(batch, product) {
+    // Personal quotes represent the upstream whole pack. A batch rule changes
+    // the local offer's form, not every same-SPU product in that batch.
+    if (product?.purchaseForm) return product.purchaseForm === 'portion';
+    if (product?.expiresAt) return false;
+    return Boolean(product?.split || batch.splitRules?.[product?.id]);
   }
   normalizeOrder(input) {
     if (!input || !UUID.test(input.submissionId ?? '')) throw new DomainError(400, 'INVALID_SUBMISSION_ID', '提交编号无效，请刷新页面后重试。');
@@ -180,12 +197,15 @@ export class LocalService {
   }
   feeCategoryForProduct(batch, product) {
     const selected = new Set(batch.productIds);
-    if (selected.has(product.id) && !this.store.getProduct(product.id)?.removedAt) return 'recommended';
+    const portion = this.isPortionProduct(batch, product);
+    if (selected.has(product.id) && portion === Boolean(batch.splitRules?.[product.id])
+      && !this.store.getProduct(product.id)?.removedAt) return 'recommended';
     const spuId = product.spuId || product.source?.spuId;
     const source = product.source;
     if (spuId && batch.samsStore && source?.platform === 'samsclub_cn'
       && source.storeId === batch.samsStore.storeId && source.storeType === batch.samsStore.storeType
       && this.store.listProducts().some(local => selected.has(local.id) && local.onSale
+        && portion === Boolean(batch.splitRules?.[local.id])
         && local.source?.platform === 'samsclub_cn' && local.source.spuId === spuId
         && local.source.storeId === batch.samsStore.storeId && local.source.storeType === batch.samsStore.storeType)) return 'recommended';
     return 'selfSelected';
@@ -201,28 +221,34 @@ export class LocalService {
     return [...locked].filter(id => batch.productIds.includes(id)).sort();
   }
   splitRecommendation(batch, product) {
+    if (!this.isPortionProduct(batch, product)) return null;
     return this.store.listProducts({ includeRemoved: true }).find(local => batch.productIds.includes(local.id) && batch.splitRules?.[local.id]
       && (local.id === product?.id || sameSourceProduct(local, product)));
   }
   assertSplitAvailable(recommendation, id) {
     if (recommendation?.removedAt) throw new DomainError(409, 'SPLIT_PRODUCT_REMOVED', '本期拼份商品已移除，无法加购；请参与下一期。', { productIds: [id] });
   }
+  orderProduct(batch, item, options = {}) {
+    // A public offer can share an ID with an old private quote. Its current
+    // catalog version is checked in prepareOrder; private metadata must never
+    // change that explicit public offer's fee or portion classification.
+    return (batch.productIds.includes(item.productId) && this.store.getProduct(item.productId))
+      || options.customerProducts?.get(item.productId)
+      || (options.ownerHash && this.store.getCustomerProduct(batch.code, options.ownerHash, item.productId)?.product)
+      || this.store.getProduct(item.productId) || { id: item.productId };
+  }
   orderHasSplit(batch, payload, options = {}) {
-    return payload.items.some(item => batch.splitRules?.[item.productId] || this.splitRecommendation(batch,
-      options.customerProducts?.get(item.productId) || (options.ownerHash && this.store.getCustomerProduct(batch.code, options.ownerHash, item.productId)?.product)
-        || this.store.getProduct(item.productId)));
+    return payload.items.some(item => this.splitRecommendation(batch, this.orderProduct(batch, item, options)));
   }
   orderHasFees(batch, payload, { customerProducts = new Map(), ownerHash = null } = {}) {
     return payload.items.some(item => {
-      const product = customerProducts.get(item.productId) || (ownerHash && this.store.getCustomerProduct(batch.code, ownerHash, item.productId)?.product)
-        || this.store.getProduct(item.productId) || { id: item.productId };
+      const product = this.orderProduct(batch, item, { customerProducts, ownerHash });
       return feeRate(batch, this.feeCategoryForProduct(batch, product)) > 0;
     });
   }
   requireFeeQuote(batch, payload, options = {}) {
     for (const item of payload.items) this.assertSplitAvailable(this.splitRecommendation(batch,
-      options.customerProducts?.get(item.productId) || (options.ownerHash && this.store.getCustomerProduct(batch.code, options.ownerHash, item.productId)?.product)
-        || this.store.getProduct(item.productId)), item.productId);
+      this.orderProduct(batch, item, options)), item.productId);
     if ((this.orderHasFees(batch, payload, options) || this.orderHasSplit(batch, payload, options)) && !payload.feeQuoteVersion) {
       throw new DomainError(409, 'FEE_QUOTE_CHANGED', '请先核对本次商品与代购费用，再确认提交。');
     }
@@ -235,7 +261,7 @@ export class LocalService {
     }
     return version;
   }
-  prepareOrder(batch, payload, { customerProducts = new Map(), ownerHash = null, quote = false } = {}) {
+  prepareOrder(batch, payload, { customerProducts = new Map(), ownerHash = null } = {}) {
     const catalog = this.getCatalog(batch);
     if (!catalog.batch.collecting) throw new DomainError(409, 'COLLECTION_CLOSED', '本期已停止收集，仍可查询已提交订单。');
     this.validateFeePolicy(batch, payload, { customerProducts, ownerHash });
@@ -249,24 +275,25 @@ export class LocalService {
         { productIds: [id], recommendedProductId: recommendation.id, catalog });
       const saved = ownerHash && this.store.getCustomerProduct(batch.code, ownerHash, id);
       if (!prepared?.selectable || !saved || saved.storeKey !== samsStoreKey(batch.samsStore)
-        || saved.product.version !== prepared.version || (!quote && Date.parse(saved.product.expiresAt) <= this.now().getTime())) {
+        || saved.product.version !== prepared.version || prepared.needsWholeQuote) {
         throw new DomainError(409, 'SELF_PRODUCT_CHANGED', '个人商品报价已失效，请刷新清单后重新确认。', { productIds: [id] });
       }
       const local = prepared.reusedProductId ? this.store.getProduct(prepared.reusedProductId) : null;
       const matches = this.store.listProducts().filter(product => product.source?.platform === 'samsclub_cn'
+        && !batch.splitRules?.[product.id]
         && product.source.spuId === prepared.spuId && product.source.storeId === batch.samsStore.storeId
         && product.source.storeType === batch.samsStore.storeType);
       if (matches.some(product => !product.onSale && !(product.source.customerSelected === true && product.revision === 1))
         || !prepared.reusedProductId && matches.some(product => product.onSale)) {
         throw new DomainError(409, 'SELF_PRODUCT_CHANGED', '团长已调整商品在售状态或售价，请重新确认。', { productIds: [id] });
       }
-      if (prepared.reusedProductId && (!local?.onSale || productVersion(local) !== prepared.localVersion)) {
+      if (prepared.reusedProductId && (!local?.onSale || batch.splitRules?.[local.id] || productVersion(local) !== prepared.localVersion)) {
         throw new DomainError(409, 'SELF_PRODUCT_CHANGED', '商品售价或在售状态已变化，请重新确认。', { productIds: [id] });
       }
       products.set(id, prepared);
     }
     for (const item of payload.items) {
-      const recommendation = this.splitRecommendation(batch, this.store.getProduct(item.productId) || products.get(item.productId));
+      const recommendation = this.splitRecommendation(batch, products.get(item.productId) || this.store.getProduct(item.productId));
       this.assertSplitAvailable(recommendation, item.productId);
       if (recommendation && recommendation.id !== item.productId) throw new DomainError(409, 'SPLIT_RECOMMENDATION_REQUIRED',
         '本期该商品按份拼单，请选择本期推荐中的同款分装商品。', { productIds: [item.productId], recommendedProductId: recommendation.id, catalog });
@@ -284,6 +311,7 @@ export class LocalService {
     const original = personal ? product : this.store.getProduct(product.id);
     const feeCategory = this.feeCategoryForProduct(batch, original);
     return { id: product.id, name: product.name, spec: product.spec, unit: product.unit,
+      purchaseForm: personal ? 'whole' : batch.splitRules?.[product.id] ? 'portion' : 'whole',
       priceCents: product.priceCents, category: product.category, imageUrl: product.imageUrl,
       description: productDescription(original), source: original.source, onSale: true,
       selfSelected: personal, feeCategory, feeRateBps: feeRate(batch, feeCategory), quotedAt: product.quotedAt,
@@ -297,7 +325,7 @@ export class LocalService {
     const phone = input.phone == null || input.phone === '' ? '' : normalizePhone(input.phone);
     const payload = this.normalizeOrder({ ...input, phone: phone || '13800138000', submissionId: '00000000-0000-4000-8000-000000000000', name: '报价' });
     const batch = this.getBatch(inputBatch);
-    const { products, personalIds } = this.prepareOrder(batch, payload, { ...options, quote: true });
+    const { products, personalIds } = this.prepareOrder(batch, payload, options);
     const additions = payload.items.map(item => ({ ...item, lineId: `quote:${item.productId}`, batchCode: batch.code, phone,
       amountCents: addCents([products.get(item.productId).priceCents * item.quantity]),
       snapshot: this.snapshotProduct(batch, products.get(item.productId), personalIds.includes(item.productId)) }));
@@ -307,7 +335,7 @@ export class LocalService {
       existing.map(line => [line.lineId, line.quantity, line.status, line.amountCents, line.feeCategory, line.feeRateBps, line.split || null])
         .sort((a, b) => a[0].localeCompare(b[0]))]);
     return { ...incrementalBilling(existing, additions, { feePolicy: batch.feePolicy }), feePolicyVersion: feePolicyVersion(batch), feeQuoteVersion: quoteVersion,
-      quoteExpired: personalIds.some(id => Date.parse(products.get(id).expiresAt) <= this.now().getTime()),
+      quoteExpired: false,
       pendingSplit: additions.some(line => line.snapshot.split),
       pendingGoodsCents: addCents(additions.filter(line => line.snapshot.split).map(line => line.amountCents)),
       pendingQuantity: additions.filter(line => line.snapshot.split).reduce((sum, line) => sum + line.quantity, 0) };

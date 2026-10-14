@@ -16,7 +16,7 @@ const draft = product => product.source?.customerSelected === true && product.re
 const sameSpu = (product, spuId, store) => product.source?.platform === 'samsclub_cn'
   && product.source.spuId === spuId && product.source.storeId === store.storeId && product.source.storeType === store.storeType;
 const quoteVersion = product => createHash('sha256').update(JSON.stringify([
-  product.localVersion || productVersion(product), product.id, product.onSale, product.quoteRevision,
+  product.localVersion || productVersion(product), product.id, product.onSale, product.quoteRevision, product.purchaseForm || 'whole',
 ])).digest('hex');
 
 export class CustomerSelection {
@@ -71,10 +71,16 @@ export class CustomerSelection {
   }
   matches(spuId, store) { return this.store.listProducts().filter(product => sameSpu(product, spuId, store)); }
   localMatch(spuId, batch) {
-    const matches = this.matches(spuId, batch.samsStore);
+    const matches = this.matches(spuId, batch.samsStore).filter(product => !batch.splitRules?.[product.id]);
     if (matches.some(product => !product.onSale && !draft(product))) return { stopped: true };
     return { product: matches.find(product => product.onSale && batch.productIds.includes(product.id))
       || matches.find(product => product.onSale) || null };
+  }
+  wholeId(spuId, batch, separate = false) {
+    const prefix = separate ? 'self_whole' : 'self';
+    let id = `${prefix}_${batch.samsStore.storeType}_${batch.samsStore.storeId}_${spuId}`;
+    if (id.length > 128) id = `${prefix}_${batch.samsStore.storeType}_${batch.samsStore.storeId}_${createHash('sha256').update(spuId).digest('hex')}`;
+    return !separate && batch.splitRules?.[id] ? this.wholeId(spuId, batch, true) : id;
   }
   product(raw, batch, keyword, queriedAt, { id, quoteRevision = 1 } = {}) {
     const match = this.localMatch(raw.spu_id, batch);
@@ -82,37 +88,39 @@ export class CustomerSelection {
     // Upstream sale and stock flags are informational for order registration.
     // The administrator's explicit local stop still applies.
     const available = raw.selectable && validPrice(raw.price_cents) && !match.stopped;
-    let selfId = `self_${batch.samsStore.storeType}_${batch.samsStore.storeId}_${raw.spu_id}`;
-    if (selfId.length > 128) selfId = `self_${batch.samsStore.storeType}_${batch.samsStore.storeId}_${createHash('sha256').update(raw.spu_id).digest('hex')}`;
+    const selfId = this.wholeId(raw.spu_id, batch);
     const recommended = Boolean(local && batch.productIds.includes(local.id));
     const result = { id: id || local?.id || selfId, name: local?.name || raw.name, spec: local?.spec || raw.spec,
-      unit: local?.unit || '件', priceCents: local?.priceCents ?? raw.price_cents,
+      unit: local?.unit || raw.unit || '件', priceCents: local?.priceCents ?? raw.price_cents,
       category: local?.category || '其他', sort: local?.sort || 0,
       description: local?.source?.description || raw.description || '', imageUrl: local?.imageUrl || raw.image_url,
       onSale: Boolean(available), selectable: Boolean(available), selfSelected: !recommended,
+      purchaseForm: 'whole',
       feeCategory: recommended ? 'recommended' : 'selfSelected', spuId: raw.spu_id,
       available: raw.available, on_sale: raw.on_sale, priceSource: local ? 'local' : 'sams',
       reusedProductId: local?.id || null, keyword, quotedAt: queriedAt,
       quoteRevision, localVersion: local ? productVersion(local) : null,
       expiresAt: new Date(this.now() + QUOTE_TTL).toISOString(),
+      wholeSnapshot: { name: raw.name, spec: raw.spec, unit: raw.unit || '件', priceCents: raw.price_cents,
+        description: raw.description || '', imageUrl: raw.image_url },
       source: { ...(local?.source || {}), platform: 'samsclub_cn', spuId: raw.spu_id,
         storeId: batch.samsStore.storeId, storeType: batch.samsStore.storeType, storeName: batch.samsStore.name,
         cityCode: batch.samsStore.cityCode, cityName: batch.samsStore.cityName,
         method: 'search', keyword, queriedAt, priceCents: raw.price_cents,
-        description: raw.description || '', images: raw.images || [], customerSelected: true },
+        description: raw.description || '', images: raw.images || [], customerSelected: true, purchaseForm: 'whole' },
     };
     // Local-price selections use the administrator's version, including when
     // their personal ID remains stable after a same-SPU local product appears.
     result.version = quoteVersion(result);
-    if (this.service.splitRecommendation(batch, result)?.removedAt) return { ...result, onSale: false, selectable: false,
-      selectionUnavailableReason: '本期拼份商品已移除，无法加购；请参与下一期。' };
-    if (recommended && (!id || batch.splitRules?.[local.id])) return { ...this.service.getCatalog(batch).products.find(p => p.id === local.id),
+    if (recommended && !id) return { ...this.service.getCatalog(batch).products.find(p => p.id === local.id),
       selfSelected: false, feeCategory: 'recommended', selectable: Boolean(available), spuId: raw.spu_id, priceSource: 'local', available: raw.available, on_sale: raw.on_sale };
     return result;
   }
   publicProduct(product, extra = {}) {
-    const { source, keyword, reusedProductId, sort, localVersion, quoteRevision, ...publicFields } = product;
-    return { ...publicFields, quoteExpired: Boolean(product.expiresAt && Date.parse(product.expiresAt) <= this.now()), ...extra };
+    const { source, keyword, reusedProductId, sort, localVersion, quoteRevision, wholeSnapshot, purchaseForm, ...publicFields } = product;
+    const purchaseIdentity = this.service.purchaseIdentity(product, 'whole');
+    return { ...publicFields, ...(purchaseIdentity ? { purchaseIdentity } : {}),
+      quoteExpired: false, ...extra };
   }
   async search(batchInput, token, params) {
     const ownerHash = customerOwner(token);
@@ -159,11 +167,14 @@ export class CustomerSelection {
     const { raw, queriedAt } = await this.detail(body.spuId, batch.samsStore);
     const fresh = this.unchanged(batch, key);
     const product = this.product(raw, fresh, selection.data.keyword, queriedAt);
-    this.service.assertSplitAvailable(this.service.splitRecommendation(fresh, product), product.id);
     if (!product.selectable) throw blocked('商品报价无效或已被团长下架，请重新查询或选择其他商品。', [product.id]);
     if (product.selfSelected) {
       const previous = this.store.getCustomerProduct(batch.code, ownerHash, product.id);
       if (previous) { product.quoteRevision = (previous.product.quoteRevision || 1) + 1; product.version = quoteVersion(product); }
+      const previousProductId = previous?.product.previousProductId || this.store.listCustomerProducts(batch.code, ownerHash)
+        .find(({ storeKey, product: saved }) => storeKey === key && saved.spuId === product.spuId
+          && saved.id !== product.id && fresh.splitRules?.[saved.id])?.product.id;
+      if (previousProductId) product.previousProductId = previousProductId;
       this.store.saveCustomerProduct(batch.code, ownerHash, key, product, this.now());
     }
     return { product: this.publicProduct(product) };
@@ -171,21 +182,29 @@ export class CustomerSelection {
   list(batchInput, token) {
     const ownerHash = customerOwner(token); const batch = this.service.getBatch(batchInput);
     const key = samsStoreKey(batch.samsStore);
-    return { products: this.store.listCustomerProducts(batch.code, ownerHash).map(({ storeKey, product: saved }) => {
-      let product = saved;
+    const listed = this.store.listCustomerProducts(batch.code, ownerHash).map(({ storeKey, product: saved }) => {
+      let product = { ...saved, purchaseForm: 'whole' };
       const storeChanged = !key || key !== storeKey;
       const closed = !this.service.safeBatch(batch).collecting;
       let changed = false;
       if (!storeChanged) {
-        if (this.service.splitRecommendation(batch, product)?.removedAt) return this.publicProduct(product,
-          { onSale: false, selectable: false, localChanged: true, selectionUnavailableReason: '本期拼份商品已移除，无法加购；请参与下一期。' });
-        const match = this.localMatch(product.spuId, batch);
-        if (match.product && batch.splitRules?.[match.product.id] && batch.productIds.includes(match.product.id)) {
-          const recommended = this.service.getCatalog(batch).products.find(value => value.id === match.product.id);
-          return this.publicProduct({ ...product, name: recommended.name, spec: recommended.spec, unit: recommended.unit,
-            priceCents: recommended.priceCents, split: recommended.split, recommendedProductId: recommended.id,
-            onSale: false, selectable: false }, { storeChanged: false, localChanged: true });
+        const collision = Boolean(batch.splitRules?.[saved.id]);
+        const separateId = collision ? this.wholeId(product.spuId, batch) : product.id;
+        const replacement = collision && this.store.getCustomerProduct(batch.code, ownerHash, separateId)?.product;
+        if (replacement) product = { ...replacement, purchaseForm: 'whole', previousProductId: saved.id };
+        else if (product.split || collision || product.reusedProductId && batch.splitRules?.[product.reusedProductId]) {
+          const snapshot = product.wholeSnapshot;
+          const verifiedWhole = snapshot && validPrice(snapshot.priceCents) && snapshot.name && snapshot.spec && snapshot.unit;
+          const contaminated = Boolean(product.split);
+          product = { ...product, ...(verifiedWhole ? snapshot : {}), id: separateId, purchaseForm: 'whole',
+            ...(collision ? { previousProductId: saved.id } : {}), reusedProductId: null, localVersion: null, priceSource: 'sams',
+            quoteRevision: (product.quoteRevision || 1) + 1, expiresAt: new Date(0).toISOString(),
+            ...(contaminated && !verifiedWhole ? { needsWholeQuote: true, priceUnavailable: true, onSale: false, selectable: false } : {}) };
+          delete product.split; delete product.recommendedProductId;
+          product.version = quoteVersion(product);
+          this.store.saveCustomerProduct(batch.code, ownerHash, key, product, this.now());
         }
+        const match = this.localMatch(product.spuId, batch);
         changed = Boolean(match.stopped || product.reusedProductId && !match.product);
         if (!changed && match.product && productVersion(match.product) !== product.localVersion) {
           product = { ...product, name: match.product.name, spec: match.product.spec, unit: match.product.unit,
@@ -206,8 +225,18 @@ export class CustomerSelection {
         }
       }
       return this.publicProduct(product, { feeCategory: this.service.feeCategoryForProduct(batch, product), storeChanged, localChanged: changed,
+        ...(product.needsWholeQuote ? { priceCents: null, selectionUnavailableReason: '原整包报价需重新查询，请搜索该商品后重新选择。' } : {}),
         ...((storeChanged || closed || changed) ? { onSale: false, selectable: false } : {}) });
-    }) };
+    });
+    // A promoted customer-origin ID may also be the local portion offer. Keep
+    // the original private record for history, and expose its whole replacement
+    // only once without altering any previously submitted snapshot.
+    const unique = new Map();
+    for (const product of listed) {
+      const previous = unique.get(product.id);
+      unique.set(product.id, { ...product, ...(previous?.previousProductId ? { previousProductId: previous.previousProductId } : {}) });
+    }
+    return { products: [...unique.values()] };
   }
   async submit(batchInput, token, input) {
     const payload = this.service.normalizeOrder(input);
@@ -246,15 +275,14 @@ export class CustomerSelection {
         const item = personal[cursor++];
         const quote = this.store.getCustomerProduct(batch.code, ownerHash, item.productId);
         if (!quote || quote.storeKey !== key) throw blocked('个人商品不属于当前清单或采购门店已调整，请重新搜索。', [item.productId]);
-        const recommendation = this.service.splitRecommendation(current, quote.product);
-        this.service.assertSplitAvailable(recommendation, item.productId);
-        if (recommendation) throw new DomainError(409, 'SPLIT_RECOMMENDATION_REQUIRED', '本期该商品按份拼单，请选择本期推荐中的同款分装商品。',
-          { productIds: [item.productId], recommendedProductId: recommendation.id, catalog: this.service.getCatalog(current) });
-        const expired = Date.parse(quote.product.expiresAt) <= this.now();
+        if (current.splitRules?.[quote.product.id]) throw blocked('原整包与分装商品编号已变化，请刷新清单后重新选择。', [item.productId]);
         const { raw, queriedAt } = await this.detail(quote.product.spuId, current.samsStore);
         const fresh = this.unchanged(batch, key);
+        // An old saved quote can still be ordered. Only changed product data
+        // requires another confirmation; elapsed time alone is not a change.
         const product = this.product(raw, fresh, quote.product.keyword, queriedAt, { id: quote.product.id,
-          quoteRevision: (quote.product.quoteRevision || 1) + Number(expired) });
+          quoteRevision: quote.product.quoteRevision || 1 });
+        if (quote.product.previousProductId) product.previousProductId = quote.product.previousProductId;
         // Keep all personal selections private even if the product became a
         // recommendation after this request started; the service resolves that
         // race against the freshly loaded batch before committing.
@@ -265,7 +293,7 @@ export class CustomerSelection {
           product.version = quoteVersion(product);
         }
         this.store.saveCustomerProduct(batch.code, ownerHash, key, product, this.now());
-        if (expired || !product.selectable || item.version !== product.version) changed = true;
+        if (!product.selectable || item.version !== product.version) changed = true;
         prepared.set(item.productId, product);
       }
     });

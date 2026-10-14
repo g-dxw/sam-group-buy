@@ -1,0 +1,10 @@
+.customer-product-pack-spec {
+  margin-top: 6px;
+  color: var(--primary);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 580px) {
+  .customer-product-pack-spec { font-size: 11px; }
+}

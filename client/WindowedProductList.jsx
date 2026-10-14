@@ -8,11 +8,14 @@ import './windowed-product-list.css';
 const itemKey = item => item.id;
 const sameRange = (a, b) => a.start === b.start && a.end === b.end;
 
-function useColumns(override) {
+function useColumns(override, active) {
   const read = () => typeof window === 'undefined' ? 3 : responsiveProductColumns(window.innerWidth);
   const [responsive, setResponsive] = useState(read);
+  const activity = useRef(active);
+  activity.current = active;
   useEffect(() => {
-    const resize = () => setResponsive(read());
+    if (!active) return;
+    const resize = () => { if (activity.current) setResponsive(read()); };
     // Column choice follows the viewport, including when this list is in a narrow panel.
     const queries = typeof window.matchMedia === 'function'
       ? [window.matchMedia('(max-width: 580px)'), window.matchMedia('(max-width: 800px)')]
@@ -24,8 +27,11 @@ function useColumns(override) {
       queries.forEach(query => query.removeEventListener ? query.removeEventListener('change', resize) : query.removeListener?.(resize));
       if (!queries.length) window.removeEventListener('resize', resize);
     };
-  }, []);
-  return Number.isInteger(override) && override >= 1 && override <= 3 ? override : responsive;
+  }, [active]);
+  const requested = Number.isInteger(override) && override >= 1 && override <= 3 ? override : responsive;
+  const columns = useRef(requested);
+  if (active) columns.current = requested;
+  return columns.current;
 }
 
 function ProductRow({ row, register, children }) {
@@ -36,9 +42,9 @@ function ProductRow({ row, register, children }) {
 function ProductWindow({
   items, getKey = itemKey, renderItem, pageSize = 20, estimatedHeight = 250,
   columns: columnOverride, overscan = 600, className = '', ariaLabel = '商品列表',
-  emptyContent = null, footer = null, scrollToStartOnMount = false,
+  emptyContent = null, footer = null, scrollToStartOnMount = false, active = true,
 }) {
-  const columns = useColumns(columnOverride);
+  const columns = useColumns(columnOverride, active);
   const chunkSize = Number.isFinite(pageSize) ? Math.max(1, Math.floor(pageSize)) : 20;
   const [loadedCount, setLoadedCount] = useState(() => Math.min(chunkSize, items.length));
   const count = Math.min(loadedCount, items.length);
@@ -60,17 +66,20 @@ function ProductWindow({
   const autoLoad = useRef(false);
   const width = useRef(null);
   const previousGeometry = useRef(null);
+  const firstLayout = useRef(true);
   const current = useRef(null);
-  current.current = { rows, metrics, count, total: items.length, chunkSize, overscan };
+  current.current = { rows, metrics, count, total: items.length, chunkSize, overscan, active };
 
   const schedule = useCallback(() => {
-    if (!alive.current || frame.current !== null) return;
+    if (!alive.current || !current.current.active || frame.current !== null) return;
     frame.current = requestAnimationFrame(() => {
       frame.current = null;
       const element = root.current;
-      if (!alive.current || !element) return;
+      if (!alive.current || !element || !current.current.active) return;
       const data = current.current;
       const bounds = element.getBoundingClientRect();
+      // A hidden tab reports zero width. Keep its measured geometry until visible.
+      if (bounds.width <= 0) return;
       let changed = false;
       if (width.current !== null && Math.abs(width.current - bounds.width) > 1) {
         heights.current.clear();
@@ -117,7 +126,15 @@ function ProductWindow({
   }, [schedule]);
 
   useLayoutEffect(() => {
-    alive.current = true;
+    alive.current = active;
+    const initialLayout = firstLayout.current;
+    firstLayout.current = false;
+    autoLoad.current = false;
+    // Tab activation is positioned by its parent; do not anchor against geometry
+    // from a different tab or scroll an inactive list whose query just changed.
+    previousGeometry.current = null;
+    if (!active) return;
+    measureAll.current = true;
     if (typeof ResizeObserver === 'function') {
       observer.current = new ResizeObserver(() => { measureAll.current = true; schedule(); });
       observer.current.observe(root.current);
@@ -130,7 +147,7 @@ function ProductWindow({
     const resize = () => { measureAll.current = true; schedule(); };
     window.addEventListener('scroll', scroll, { passive: true });
     window.addEventListener('resize', resize);
-    if (scrollToStartOnMount && root.current.getBoundingClientRect().top < 0) {
+    if (initialLayout && scrollToStartOnMount && root.current.getBoundingClientRect().top < 0) {
       window.scrollBy(0, root.current.getBoundingClientRect().top);
     }
     schedule();
@@ -143,13 +160,14 @@ function ProductWindow({
       if (frame.current !== null) cancelAnimationFrame(frame.current);
       frame.current = null;
     };
-  }, [schedule, scrollToStartOnMount]);
+  }, [active, schedule, scrollToStartOnMount]);
 
   useLayoutEffect(() => {
     const element = root.current;
-    if (!element) return;
+    if (!active || !element) return;
     if (loadedCount === 0 && items.length > 0) setLoadedCount(Math.min(chunkSize, items.length));
     const bounds = element.getBoundingClientRect();
+    if (bounds.width <= 0) return;
     const previous = previousGeometry.current;
     if (previous && previous.metrics !== metrics && bounds.top <= 0 && bounds.bottom > 0) {
       // Another list or panel above us can move this root. Anchor only this list's
@@ -174,17 +192,17 @@ function ProductWindow({
     }
     if (!observer.current) measureAll.current = true;
     schedule();
-  }, [rows, metrics, overscan, schedule, loadedCount, items.length, chunkSize]);
+  }, [active, rows, metrics, overscan, schedule, loadedCount, items.length, chunkSize]);
 
   useEffect(() => {
-    if (typeof IntersectionObserver !== 'function' || count >= items.length || !sentinel.current) return;
+    if (!active || typeof IntersectionObserver !== 'function' || count >= items.length || !sentinel.current) return;
     const intersection = new IntersectionObserver(entries => {
-      if (entries.some(entry => entry.isIntersecting)) { autoLoad.current = true; schedule(); }
+      if (current.current.active && entries.some(entry => entry.isIntersecting)) { autoLoad.current = true; schedule(); }
     }, { rootMargin: '400px 0px' });
     intersection.observe(sentinel.current);
     // Re-observe after each chunk, so an end still in view keeps loading short pages.
     return () => intersection.disconnect();
-  }, [count, items.length, schedule]);
+  }, [active, count, items.length, schedule]);
 
   const focusRow = focusedKey === null ? -1 : rows.findIndex(row => row.keys.includes(focusedKey));
   const requestedRow = pendingFocus.current === null ? -1 : Math.floor(pendingFocus.current / columns);
@@ -225,6 +243,7 @@ function ProductWindow({
     {items.length > 0 && <div className="windowed-products-controls">
       <span role="status" aria-live="polite">已显示 {count} / {items.length} 件商品</span>
       {!allLoaded && <button className="windowed-products-more" type="button" onClick={() => {
+        if (!active) return;
         pendingFocus.current = count;
         setLoadedCount(value => nextProductCount(value, items.length, chunkSize));
       }}>加载更多</button>}

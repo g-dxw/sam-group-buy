@@ -216,6 +216,8 @@ test('same-SPU local sale prices win, drafts remain private, explicit stops cann
   f.service.updateBatch(f.batch.code, { productIds: ['ordinary', 'sam_111'] });
   const recommended = await add(f);
   assert.equal(recommended.selfSelected, false); assert.equal(recommended.priceCents, 4500);
+  assert.equal(recommended.id, 'sam_111');
+  assert.deepEqual(recommended.purchaseIdentity, { platform: 'samsclub_cn', storeType: 2, storeId: '6505', spuId: '111', kind: 'whole' });
   const normalPayload = order(f, [recommended]);
   await f.customer.submit(f.batch, null, normalPayload);
   const normalSnapshot = f.store.listOrderLines(f.batch.code).find(line => line.submissionId === normalPayload.submissionId).snapshot;
@@ -228,26 +230,122 @@ test('same-SPU local sale prices win, drafts remain private, explicit stops cann
   other.store.importProducts([{ ...ordinary, id: 'sam_111', priceCents: 8000, source: { ...source, storeId: '6506' }, imageUrl: 'https://images.test/111.jpg' }, ordinary]);
   const separate = await add(other);
   assert.equal(separate.id, 'self_2_6505_111'); assert.equal(separate.priceCents, 2980);
+  assert.deepEqual(separate.purchaseIdentity, { platform: 'samsclub_cn', storeType: 2, storeId: '6505', spuId: '111', kind: 'whole' });
 });
 
-test('changed or expired quotes refresh durably before 409 and a second confirmation succeeds without a loop', async t => {
+test('a real price change after elapsed time refreshes durably before 409 and a second confirmation succeeds without a loop', async t => {
   const f = fixture(t); const first = await add(f); const payload = order(f, [first]);
+  f.advance(31 * 60_000);
   f.state.detail.set('111', makeRow('111', 3500));
   await assert.rejects(f.customer.submit(f.batch, token, payload), { code: 'SELF_PRODUCT_CHANGED' });
   assert.equal(f.store.listOrderLines(f.batch.code).length, 0);
   const refreshed = f.customer.list(f.batch, token).products[0];
   assert.equal(refreshed.priceCents, 3500); assert.notEqual(refreshed.version, first.version);
+  assert.equal(refreshed.quoteExpired, false);
+  await assert.rejects(f.customer.submit(f.batch, token, payload), { code: 'SELF_PRODUCT_CHANGED' });
   await f.customer.submit(f.batch, token, order(f, [refreshed]));
-  f.advance(31 * 60_000);
-  assert.equal(f.customer.list(f.batch, token).products[0].quoteExpired, true);
-  const expired = order(f, [refreshed]);
-  await assert.rejects(f.customer.submit(f.batch, token, expired), { code: 'SELF_PRODUCT_CHANGED' });
-  const renewed = f.customer.list(f.batch, token).products[0];
-  assert.equal(renewed.quoteExpired, false);
-  assert.notEqual(renewed.version, refreshed.version);
-  await assert.rejects(f.customer.submit(f.batch, token, expired), { code: 'SELF_PRODUCT_CHANGED' });
-  await f.customer.submit(f.batch, token, order(f, [renewed]));
-  assert.equal(f.store.listOrderLines(f.batch.code).length, 2);
+  assert.equal(f.store.listOrderLines(f.batch.code).length, 1);
+});
+
+test('saved personal prices remain purchasable after 31 minutes or several days without a time-only version change', async t => {
+  for (const elapsed of [31 * 60_000, 7 * 86400_000]) {
+    const f = fixture(t); const personal = await add(f);
+    const payload = order(f, [personal]);
+    const quoteInput = { phone: payload.phone, items: payload.items };
+    const before = f.customer.quote(f.batch, token, quoteInput);
+    const staleSelection = await f.customer.search(f.batch, token, { keyword: '商品' });
+    f.advance(elapsed);
+    const listed = f.customer.list(f.batch, token).products[0];
+    assert.equal(listed.version, personal.version); assert.equal(listed.priceCents, 2980);
+    assert.equal(listed.quoteExpired, false); assert.equal(listed.onSale, true); assert.equal(listed.selectable, true);
+    const quoted = f.customer.quote(f.batch, token, quoteInput);
+    assert.equal(quoted.quoteExpired, false); assert.equal(quoted.totalCents, 2980);
+    assert.equal(quoted.feeQuoteVersion, before.feeQuoteVersion);
+    await assert.rejects(f.customer.add(f.batch, token, { selectionId: staleSelection.selectionId, spuId: '111' }), { code: 'SAMS_SELECTION_EXPIRED' });
+    const detailCallsBefore = mockDetailCalls(f).length;
+    assert.equal((await f.customer.submit(f.batch, token, { ...payload, feeQuoteVersion: quoted.feeQuoteVersion })).status, 'completed');
+    assert.equal(mockDetailCalls(f).length - detailCallsBefore, 1);
+    const saved = f.store.getCustomerProduct(f.batch.code, customerOwner(token), personal.id).product;
+    assert.equal(saved.version, personal.version); assert.equal(saved.quoteRevision, 1);
+    assert.equal(f.store.listOrderLines(f.batch.code)[0].snapshot.priceCents, 2980);
+    assert.equal(f.service.queryOrders(f.batch, payload.phone).totalCents, 2980);
+  }
+});
+
+test('legacy personal products without a valid expiry timestamp continue to quote and submit with verified source prices', async t => {
+  for (const expiry of [undefined, null, 'legacy-no-date']) {
+    const f = fixture(t); const personal = await add(f);
+    const record = f.store.getCustomerProduct(f.batch.code, customerOwner(token), personal.id);
+    const legacy = { ...record.product, expiresAt: expiry };
+    if (expiry === undefined) delete legacy.expiresAt;
+    f.store.saveCustomerProduct(f.batch.code, customerOwner(token), record.storeKey, legacy, start);
+    f.advance(3 * 86400_000);
+    const listed = f.customer.list(f.batch, token).products[0];
+    assert.equal(listed.quoteExpired, false); assert.equal(listed.version, personal.version);
+    const input = order(f, [listed]);
+    const quoted = f.customer.quote(f.batch, token, { phone: input.phone, items: input.items });
+    assert.equal(quoted.quoteExpired, false); assert.equal(quoted.totalCents, 2980);
+    assert.equal((await f.customer.submit(f.batch, token, { ...input, feeQuoteVersion: quoted.feeQuoteVersion })).status, 'completed');
+    assert.equal(f.store.listOrderLines(f.batch.code)[0].snapshot.priceCents, 2980);
+  }
+});
+
+test('mixed recommended and old personal selections with fees commit atomically and preserve historical prices and rates', async t => {
+  const f = fixture(t);
+  f.service.updateBatch(f.batch.code, { feePolicy: { recommendedRateBps: 100, selfSelectedRateBps: 200 } });
+  const personal = await add(f); const regular = f.service.getCatalog(f.batch).products[0];
+  f.advance(2 * 86400_000);
+  const input = order(f, [regular, personal], { items: [
+    { productId: regular.id, quantity: 1, version: regular.version },
+    { productId: personal.id, quantity: 2, version: personal.version },
+  ], feePolicyVersion: f.service.getCatalog(f.batch).batch.feePolicyVersion });
+  const quote = f.customer.quote(f.batch, token, { phone: input.phone, items: input.items, feePolicyVersion: input.feePolicyVersion });
+  assert.equal(quote.quoteExpired, false); assert.equal(quote.goodsTotalCents, 6960);
+  assert.equal(quote.recommendedFeeCents, 10); assert.equal(quote.selfSelectedFeeCents, 119); assert.equal(quote.totalCents, 7089);
+  const payload = { ...input, feeQuoteVersion: quote.feeQuoteVersion };
+  f.store.db.exec("CREATE TRIGGER fail_old_personal BEFORE INSERT ON order_lines WHEN NEW.product_id='self_2_6505_111' BEGIN SELECT RAISE(ABORT,'old personal rollback'); END");
+  await assert.rejects(f.customer.submit(f.batch, token, payload), /old personal rollback/);
+  assert.equal(f.store.listOrderLines(f.batch.code).length, 0); assert.equal(f.store.getSubmission(f.batch.code, input.submissionId), null);
+  assert.equal(f.store.getProduct(personal.id), null);
+  f.store.db.exec('DROP TRIGGER fail_old_personal');
+  assert.equal((await f.customer.submit(f.batch, token, payload)).status, 'completed');
+  const lines = f.store.listExportLines(f.batch.code);
+  assert.deepEqual(lines.map(line => [line.productId, line.priceCents, line.quantity, line.feeRateBps, line.feeCents]),
+    [['ordinary', 1000, 1, 100, 10], [personal.id, 2980, 2, 200, 119]]);
+  const snapshots = f.store.listOrderLines(f.batch.code).map(line => line.snapshot);
+  f.advance(7 * 86400_000);
+  assert.deepEqual(f.store.listOrderLines(f.batch.code).map(line => line.snapshot), snapshots);
+  assert.deepEqual(f.store.listExportLines(f.batch.code), lines);
+  assert.equal(f.service.queryOrders(f.batch, payload.phone).totalCents, 7089);
+});
+
+test('elapsed time does not weaken real source-price, specification, store, fee or administrator-stop checks', async t => {
+  for (const change of ['missing-price', 'specification', 'store', 'fees', 'stop']) {
+    const f = fixture(t);
+    if (change === 'stop') {
+      f.store.importProducts([ordinary, { ...ordinary, id: 'sam_111', priceCents: 4500,
+        source: { platform: 'samsclub_cn', spuId: '111', storeId: '6505', storeType: 2 }, imageUrl: 'https://images.test/111.jpg' }]);
+    }
+    const personal = await add(f); const payload = order(f, [personal]);
+    f.advance(2 * 86400_000);
+    if (change === 'missing-price') f.state.detail.set('111', makeRow('111', 2980, { priceInfo: [{ priceType: 2, price: '0' }] }));
+    if (change === 'specification') f.state.detail.set('111', makeRow('111', 2980, { title: '商品 111 2kg' }));
+    if (change === 'store') f.state.detail.set('111', makeRow('111', 2980, { storeId: '6506' }));
+    if (change === 'fees') f.service.updateBatch(f.batch.code, { feePolicy: { recommendedRateBps: 0, selfSelectedRateBps: 200 } });
+    if (change === 'stop') f.service.updateProduct('sam_111', { onSale: false });
+    await assert.rejects(f.customer.submit(f.batch, token, payload), { code: change === 'fees' ? 'FEE_POLICY_CHANGED' : 'SELF_PRODUCT_CHANGED' });
+    assert.equal(f.store.listOrderLines(f.batch.code).length, 0); assert.equal(f.store.getSubmission(f.batch.code, payload.submissionId), null);
+  }
+});
+
+test('old personal selections still belong only to their original customer token', async t => {
+  const f = fixture(t); const personal = await add(f); f.advance(7 * 86400_000);
+  const payload = order(f, [personal]);
+  assert.deepEqual(f.customer.list(f.batch, otherToken).products, []);
+  assert.throws(() => f.customer.quote(f.batch, otherToken, { phone: payload.phone, items: payload.items }), { code: 'SELF_PRODUCT_CHANGED' });
+  await assert.rejects(f.customer.submit(f.batch, otherToken, payload), { code: 'SELF_PRODUCT_CHANGED' });
+  assert.equal(f.store.listOrderLines(f.batch.code).length, 0);
+  assert.equal((await f.customer.submit(f.batch, token, payload)).status, 'completed');
 });
 
 test('unavailable/missing-price quotes remain recoverable but cannot create orders; closed or changed stores retain private lists', async t => {

@@ -21,7 +21,7 @@ function SamsMore({ automatic, disabled, loading, retry, requestKey, onMore }) {
   return <div className="customer-sams-more" ref={sentinel}><button type="button" className="button secondary" disabled={disabled} onClick={() => more.current(false)}>{loading ? '加载中…' : retry ? '重试加载更多' : '加载更多商品'}</button></div>;
 }
 
-export default function CustomerSamsSearch({ base, api, store, initialKeyword = '', disabled, identityError, addingId, renderProduct, onAdd, onClose }) {
+export default function CustomerSamsSearch({ base, api, store, initialKeyword = '', keywordRequestKey = 0, active = true, disabled, identityError, addingId, renderProduct, onAdd }) {
   const [keyword, setKeyword] = useState(initialKeyword);
   const [results, setResults] = useState(emptyResults);
   const [loading, setLoading] = useState(false);
@@ -39,8 +39,10 @@ export default function CustomerSamsSearch({ base, api, store, initialKeyword = 
   const currentKeyword = useRef(initialKeyword);
   const queryStore = useRef('');
   const currentStore = useRef(storeKey(store));
+  const currentActive = useRef(active);
   const storeIdentity = storeKey(store);
   currentStore.current = storeIdentity;
+  currentActive.current = active;
 
   function replaceResults(value) { currentResults.current = value; setResults(value); }
   function cancelSearch() {
@@ -50,7 +52,7 @@ export default function CustomerSamsSearch({ base, api, store, initialKeyword = 
   }
 
   useEffect(() => {
-    alive.current = true; input.current?.focus();
+    alive.current = true;
     return () => { alive.current = false; generation.current += 1; controller.current?.abort(); inFlight.current = null; };
   }, []);
 
@@ -58,7 +60,16 @@ export default function CustomerSamsSearch({ base, api, store, initialKeyword = 
 
   useEffect(() => {
     currentKeyword.current = initialKeyword; setKeyword(initialKeyword); cancelSearch();
-  }, [initialKeyword]);
+    if (keywordRequestKey > 0 && currentActive.current) input.current?.focus({ preventScroll: true });
+  }, [initialKeyword, keywordRequestKey]);
+
+  useEffect(() => {
+    // Tab changes retain results. Only background pagination is cancelled;
+    // an explicit query can finish and be ready when the customer comes back.
+    if (active || !inFlight.current?.automatic) return;
+    controller.current?.abort(); controller.current = null;
+    generation.current += 1; inFlight.current = null; setLoading(false);
+  }, [active]);
 
   function changeKeyword(value) {
     if (value === currentKeyword.current) return;
@@ -66,7 +77,7 @@ export default function CustomerSamsSearch({ base, api, store, initialKeyword = 
   }
 
   async function search(page = 1, automatic = false) {
-    if (!store || disabled || identityError || addingId || addition.current || inFlight.current) return;
+    if (!currentActive.current || !store || disabled || identityError || addingId || addition.current || inFlight.current) return;
     const previous = currentResults.current;
     if (page > 1 && (expired || queryStore.current !== currentStore.current || page !== previous.page + 1 || !previous.has_more)) return;
     if (automatic && (automaticPaused.current || error || expired || !previous.products.length || page === 1)) return;
@@ -75,7 +86,7 @@ export default function CustomerSamsSearch({ base, api, store, initialKeyword = 
     const version = ++generation.current;
     const abort = new AbortController();
     const targetStore = currentStore.current;
-    const flight = { version, page, query, store: targetStore };
+    const flight = { version, page, query, store: targetStore, automatic };
     inFlight.current = flight; controller.current = abort; queryStore.current = targetStore;
     automaticPaused.current = false;
     if (page === 1) replaceResults({ ...emptyResults(), query });
@@ -86,6 +97,7 @@ export default function CustomerSamsSearch({ base, api, store, initialKeyword = 
       const params = new URLSearchParams({ keyword: query, page: String(page) });
       const result = await api(`${base}/sams/search?${params}`, { signal: abort.signal });
       if (!alive.current || version !== generation.current || targetStore !== currentStore.current) return;
+      if (automatic && !currentActive.current) return;
       if (!Array.isArray(result.products) || !result.selectionId || Number(result.page) !== page) throw new Error('商品结果暂不可用，请重新查询。');
       if (result.store && storeKey(result.store) !== targetStore) throw new Error('本期采购门店已变化，请刷新页面后重新查询。');
       const seen = new Set(currentResults.current.products.map(product => product.id));
@@ -109,7 +121,7 @@ export default function CustomerSamsSearch({ base, api, store, initialKeyword = 
   }
 
   async function add(product) {
-    if (disabled || identityError || addingId || addition.current || expired) return;
+    if (!currentActive.current || disabled || identityError || addingId || addition.current || expired) return;
     const version = generation.current;
     addition.current = true; setError('');
     try { await onAdd(product, product.selectionId); }
@@ -122,19 +134,18 @@ export default function CustomerSamsSearch({ base, api, store, initialKeyword = 
     } finally { addition.current = false; }
   }
 
-  const moreDisabled = loading || disabled || Boolean(addingId) || expired || Boolean(identityError);
+  const moreDisabled = !active || loading || disabled || Boolean(addingId) || expired || Boolean(identityError);
   const nextPage = results.page + 1;
   const renderMore = ({ allLoaded, visibleEndReached }) => results.has_more && allLoaded && visibleEndReached && <SamsMore automatic={!moreDisabled && !error && !automaticPaused.current} disabled={moreDisabled} loading={loading} retry={Boolean(error)} requestKey={`${results.query}:${storeIdentity}:${results.page}:${results.products.length}`} onMore={automatic => search(nextPage, automatic)} />;
 
   return <section className="customer-sams-search" aria-labelledby="customer-sams-title" data-product-image-focus-fallback tabIndex={-1}>
-    <div className="customer-sams-heading"><div><h2 id="customer-sams-title">搜索山姆商品</h2><p>{store ? `本期采购门店：${store.cityName ? `${store.cityName} · ` : ''}${store.name || '山姆门店'}。自选商品只加入你的清单。` : '本期尚未设置采购门店，请联系团长开通自选；推荐商品仍可正常购买。'}</p></div><button type="button" className="text-button" onClick={onClose} disabled={Boolean(addingId)}>收起搜索</button></div>
-    <form className="customer-sams-form" onSubmit={event => { event.preventDefault(); search(); }}><label htmlFor="customer-sams-keyword">想买什么？</label><div><input id="customer-sams-keyword" ref={input} data-product-image-focus-fallback type="search" value={keyword} onChange={event => changeKeyword(event.target.value)} onInput={event => changeKeyword(event.currentTarget.value)} maxLength={80} placeholder="例如：牛肉卷、牛奶、麻薯" disabled={!store || Boolean(addingId)} /><button type="submit" className="button primary" disabled={!store || disabled || Boolean(identityError) || Boolean(addingId) || loading || !keyword.trim()}>{loading ? '查询中…' : '查询商品'}</button></div></form>
+    <div className="customer-sams-heading"><div><h2 id="customer-sams-title">查询山姆商品</h2><p>{store ? `本期采购门店：${store.cityName ? `${store.cityName} · ` : ''}${store.name || '山姆门店'}` : '本期尚未设置采购门店，请联系团长开通自选；推荐商品仍可正常购买。'}</p></div></div>
+    <form className="customer-sams-form" onSubmit={event => { event.preventDefault(); search(); }}><label htmlFor="customer-sams-keyword">搜索山姆商品</label><div><input id="customer-sams-keyword" ref={input} data-product-image-focus-fallback type="search" value={keyword} onChange={event => changeKeyword(event.target.value)} onInput={event => changeKeyword(event.currentTarget.value)} maxLength={80} placeholder="输入山姆商品名称，例如：牛肉卷" disabled={!store || Boolean(addingId)} /><button type="submit" className="button primary" disabled={!active || !store || disabled || Boolean(identityError) || Boolean(addingId) || loading || !keyword.trim()}>{loading ? '查询中…' : '查询商品'}</button></div></form>
     {identityError && <p className="notice error" role="alert">{identityError}</p>}
     {error && <div className="notice error" role="alert"><span>{error}</span>{results.query && <button type="button" disabled={loading || disabled || Boolean(addingId) || Boolean(identityError)} onClick={() => search(expired ? 1 : failedPage)}>重新查询</button>}</div>}
-    {!!results.products.length && <><p className="customer-sams-count" role="status">“{results.query}” · 已加载 {results.products.length} 件{results.queried_at ? ` · ${new Date(results.queried_at).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false })} 查询` : ''}</p><WindowedProductList className="customer-product-list" ariaLabel="山姆商品查询结果" items={results.products} getKey={product => product.id} resetKey={`${base}:${storeIdentity}:${results.query}`} footer={renderMore} renderItem={product => renderProduct(product, { key: product.id, disabled: disabled || expired || Boolean(identityError) || Boolean(addingId), adding: addingId === product.id, onAdd: () => add(product) })} /></>}
+    {!!results.products.length && <><p className="customer-sams-count" role="status">“{results.query}” · 已加载 {results.products.length} 件{results.queried_at ? ` · ${new Date(results.queried_at).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false })} 查询` : ''}</p><WindowedProductList active={active} className="customer-product-list" ariaLabel="山姆商品查询结果" items={results.products} getKey={product => product.id} resetKey={`${base}:${storeIdentity}:${results.query}`} footer={renderMore} renderItem={product => renderProduct(product, { key: product.id, disabled: disabled || expired || Boolean(identityError) || Boolean(addingId), adding: addingId === product.id, onAdd: () => add(product) })} /></>}
     {loading && <div className="customer-sams-loading" role="status"><span className="spinner" />正在查询山姆商品…</div>}
     {!loading && results.query && !results.products.length && !error && <div className="customer-sams-empty"><h3>暂未找到匹配的商品</h3><p>换个商品名称试试，或联系团长帮你找。</p></div>}
     {!results.products.length && results.has_more && renderMore({ allLoaded: true, visibleEndReached: true })}
-    <p className="customer-sams-help">已上架同款沿用后台售价；标有“按份拼单”的商品按每份规格和价格报名，截单后确认成团。其他自选商品按山姆查询价格计算。属于本期推荐的商品使用推荐费率，其余使用自选费率，费用在结算时单独展示。价格可能变化，提交时会再次核对。</p>
   </section>;
 }

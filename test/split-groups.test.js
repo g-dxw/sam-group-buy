@@ -8,6 +8,7 @@ import { LocalStore, productVersion, samsStoreKey } from '../server/local-store.
 import { LocalService } from '../server/local-service.js';
 import { CustomerSelection, customerOwner } from '../server/customer-selection.js';
 import { normalizeSplitRules, allocateSplit } from '../server/split-groups.js';
+import { SamsCatalog } from '../server/sams-catalog.js';
 
 const time = '2026-10-13T10:00:00.000Z';
 const phone = '13800138000';
@@ -24,7 +25,34 @@ function fixture(t, options = {}) {
   const batch = service.createBatch({ requestId: randomUUID(), communityName: '拼份验收', samsStore: storeLocation,
     splitRules: { beef: rule }, ...options.batch }).batch;
   t.after(() => store.close());
-  return { store, service, batch, advance: (ms = 1) => clock += ms };
+  return { store, service, batch, now: () => clock, advance: (ms = 1) => clock += ms };
+}
+function customerFixture(f) {
+  const token = randomUUID();
+  const state = { priceCents: 21000, hook: null, calls: [] };
+  const sams = new SamsCatalog({ now: f.now, fetchImpl: async (url, init) => {
+    if (!String(url).startsWith('https://api-sams.walmartmobile.cn/api/v1/sams/')) throw new Error('remote calls forbidden');
+    const body = JSON.parse(init.body); state.calls.push({ url, body });
+    const detail = url.endsWith('querySpuDetailToNFC');
+    if (detail && state.hook) await state.hook();
+    const row = { spuId: '111', storeId: '6505', storeType: 2, title: '山姆牛肉整盒 1.8kg',
+      subTitle: '原整盒商品说明', image: 'https://images.test/111.jpg',
+      priceInfo: [{ priceType: 1, price: String(state.priceCents) }],
+      isAvailable: true, isPutOnSale: true, isStoreAvailable: true, stockInfo: { stockQuantity: 5 } };
+    return new Response(JSON.stringify({ code: 'Success', data: detail ? row : { dataList: [row], hasNextPage: false } }));
+  } });
+  const customer = new CustomerSelection({ store: f.store, service: f.service, sams, now: f.now });
+  const addWhole = async () => {
+    const search = await customer.search(f.batch, token, { keyword: '牛肉' });
+    return (await customer.add(f.batch, token, { selectionId: search.selectionId, spuId: '111' })).product;
+  };
+  const payload = selections => {
+    const items = selections.map(({ product, quantity = 1 }) => ({ productId: product.id, quantity, version: product.version }));
+    const quote = customer.quote(f.batch, token, { phone, items, feePolicyVersion: f.service.getCatalog(f.batch).batch.feePolicyVersion });
+    return { submissionId: randomUUID(), name: '整包与分装顾客', phone, items,
+      feePolicyVersion: quote.feePolicyVersion, feeQuoteVersion: quote.feeQuoteVersion };
+  };
+  return { token, state, customer, addWhole, payload };
 }
 function makeOrder(f, quantity, overrides = {}, productId = 'beef') {
   const catalog = f.service.getCatalog(f.batch);
@@ -231,25 +259,142 @@ test('same-time FIFO follows stable line ID instead of insertion order', () => {
   assert.deepEqual(result.allocations, { a: 2, z: 1 });
 });
 
-test('same-SPU private entries cannot bypass split, search returns portion catalog and private list redirects', async t => {
-  const f = fixture(t); const token = randomUUID(); const ownerHash = customerOwner(token);
+test('same-SPU whole-pack search and recommended portions coexist with their own prices, units and fee rates', async t => {
+  const f = fixture(t, { batch: { feePolicy: { recommendedRateBps: 100, selfSelectedRateBps: 500 } } });
+  const c = customerFixture(f);
+  const portion = f.service.getCatalog(f.batch).products.find(product => product.id === 'beef');
+  const whole = await c.addWhole();
+  assert.equal(portion.purchaseIdentity.kind, 'portion');
+  assert.equal(whole.purchaseIdentity.kind, 'whole');
+  assert.equal(whole.id, 'self_2_6505_111'); assert.notEqual(whole.id, portion.id);
+  assert.equal(whole.priceCents, 21000); assert.equal(whole.spec, '1.8kg'); assert.equal(whole.unit, '件');
+  assert.equal(whole.split, undefined); assert.equal(whole.feeCategory, 'selfSelected');
+  assert.equal(portion.priceCents, 6000); assert.equal(portion.spec, rule.portionSpec); assert.equal(portion.unit, '份');
+  const payload = c.payload([{ product: portion, quantity: 3 }, { product: whole }]);
+  const quote = c.customer.quote(f.batch, c.token, { phone, items: payload.items, feePolicyVersion: payload.feePolicyVersion });
+  assert.equal(quote.goodsTotalCents, 39000); assert.equal(quote.recommendedFeeCents, 180);
+  assert.equal(quote.selfSelectedFeeCents, 1050); assert.equal(quote.totalCents, 40230);
+  assert.equal((await c.customer.submit(f.batch, c.token, payload)).status, 'completed');
+  assert.equal(f.store.getSubmission(f.batch.code, payload.submissionId).expectedLines, 2);
+  const before = f.store.listExportLines(f.batch.code);
+  const packLine = before.find(line => line.productId === whole.id);
+  assert.deepEqual([packLine.unit, packLine.priceCents, packLine.feeCategory, packLine.feeRateBps, packLine.feeCents],
+    ['件', 21000, 'selfSelected', 500, 1050]);
+  assert.equal(packLine.split, undefined);
+  assert.equal(f.service.queryOrders(f.batch, phone).totalCents, 22050);
+  const group = confirm(f);
+  assert.equal(group.progress.totalPortions, 3); assert.equal(group.progress.purchasedPacks, 1);
+  assert.equal(group.customers.length, 1); assert.equal(group.customers[0].lineId, before.find(line => line.productId === portion.id).lineId);
+  const after = f.store.listExportLines(f.batch.code);
+  assert.equal(after.find(line => line.productId === whole.id).amountCents, 21000);
+  assert.equal(after.find(line => line.productId === whole.id).feeCents, 1050);
+  assert.equal(f.service.queryOrders(f.batch, phone).totalCents, 40230);
+  assert.equal(f.service.getStats([f.batch.code]).products.length, 2);
+  f.service.updateProduct('beef', { priceCents: 25000 });
+  assert.equal(f.store.listExportLines(f.batch.code).find(line => line.productId === whole.id).priceCents, 21000);
+  assert.equal(f.store.listExportLines(f.batch.code).find(line => line.productId === portion.id).priceCents, 6000);
+});
+
+test('legacy private whole-pack quotes never become portion prices or redirect to the portion product', async t => {
+  const f = fixture(t); const c = customerFixture(f); const ownerHash = customerOwner(c.token);
   const personal = { id: 'self_2_6505_111', name: '旧私人整盒', spec: '1.8kg', unit: '盒', priceCents: 18000,
     source, spuId: '111', onSale: true, selectable: true, version: 'a'.repeat(64), expiresAt: '2026-10-14T00:00:00Z',
     selfSelected: true, reusedProductId: 'beef', localVersion: productVersion(f.store.getProduct('beef')) };
   f.store.saveCustomerProduct(f.batch.code, ownerHash, samsStoreKey(storeLocation), personal, Date.parse(time));
-  const customer = new CustomerSelection({ store: f.store, service: f.service, sams: {}, now: () => Date.parse(time) });
-  const product = customer.product({ spu_id: '111', selectable: true, available: true, on_sale: true }, f.service.getBatch(f.batch), '牛肉', time);
-  assert.equal(product.id, 'beef'); assert.equal(product.unit, '份'); assert.equal(product.priceCents, 6000); assert.equal(product.split.partsPerPack, 3);
-  const listed = customer.list(f.batch, token).products[0]; assert.equal(listed.recommendedProductId, 'beef'); assert.equal(listed.selectable, false);
-  assert.equal(listed.priceCents, 6000); assert.equal(listed.split.partsPerPack, 3);
-  const payload = { submissionId: randomUUID(), phone, name: '客户', items: [{ productId: personal.id, quantity: 1, version: personal.version }],
-    feePolicyVersion: f.service.getCatalog(f.batch).batch.feePolicyVersion, feeQuoteVersion: 'b'.repeat(64) };
-  assert.throws(() => customer.quote(f.batch, token, { items: payload.items, phone, feePolicyVersion: payload.feePolicyVersion }), { code: 'SPLIT_RECOMMENDATION_REQUIRED' });
-  await assert.rejects(customer.submit(f.batch, token, payload), { code: 'SPLIT_RECOMMENDATION_REQUIRED' });
+  const listed = c.customer.list(f.batch, c.token).products[0];
+  assert.equal(listed.id, personal.id); assert.equal(listed.purchaseIdentity.kind, 'whole');
+  assert.equal(listed.recommendedProductId, undefined); assert.equal(listed.split, undefined);
+  assert.equal(listed.priceCents, 18000); assert.equal(listed.spec, '1.8kg'); assert.equal(listed.unit, '盒');
+  const refreshed = await c.addWhole();
+  assert.equal(refreshed.id, personal.id); assert.equal(refreshed.priceCents, 21000);
+  assert.equal(refreshed.split, undefined); assert.equal(refreshed.spec, '1.8kg'); assert.equal(refreshed.unit, '件');
+  await c.customer.submit(f.batch, c.token, c.payload([{ product: refreshed }]));
+  assert.equal(f.store.listOrderLines(f.batch.code)[0].snapshot.split, undefined);
+});
+
+test('an existing private whole quote remains whole after a matching recommendation is split and later settled', async t => {
+  const f = fixture(t, { products: [products[1]], batch: { splitRules: {} } }); const c = customerFixture(f);
+  const oldWhole = await c.addWhole();
+  f.store.importProducts(products);
+  f.service.updateBatch(f.batch.code, { productIds: ['beef', 'milk'], splitRules: { beef: rule },
+    feePolicy: { recommendedRateBps: 100, selfSelectedRateBps: 500 } });
+  const listed = c.customer.list(f.batch, c.token).products[0];
+  assert.equal(listed.id, oldWhole.id); assert.equal(listed.priceCents, 21000); assert.equal(listed.spec, '1.8kg');
+  assert.equal(listed.feeCategory, 'selfSelected'); assert.equal(listed.split, undefined); assert.equal(listed.unit, '件');
+  submit(f, 3, { phone: '13800138001' }); confirm(f);
+  f.service.updateBatch(f.batch.code, { collecting: true });
+  const available = await c.addWhole();
+  assert.equal(available.selectable, true); assert.equal(available.purchaseIdentity.kind, 'whole');
+  await c.customer.submit(f.batch, c.token, c.payload([{ product: available }]));
+  const line = f.store.listExportLines(f.batch.code).find(line => line.productId === available.id);
+  assert.equal(line.split, undefined); assert.equal(line.feeRateBps, 500); assert.equal(line.priceCents, 21000);
+  assert.equal(f.service.getSplitGroups(f.batch)[0].progress.totalPortions, 3);
+});
+
+test('a private whole ID later used for a portion recommendation migrates to a distinct whole ID before either can be bought', async t => {
+  const f = fixture(t, { products: [products[1]], batch: { splitRules: {} } }); const c = customerFixture(f);
+  const original = await c.addWhole();
+  f.store.importProducts([products[1], { ...products[0], id: original.id }]);
+  f.service.updateBatch(f.batch.code, { productIds: ['milk', original.id], splitRules: { [original.id]: rule } });
+  const portion = f.service.getCatalog(f.batch).products.find(product => product.id === original.id);
+  const migrated = c.customer.list(f.batch, c.token).products[0];
+  assert.equal(migrated.id, 'self_whole_2_6505_111'); assert.equal(migrated.previousProductId, original.id);
+  assert.equal(migrated.purchaseIdentity.kind, 'whole'); assert.equal(migrated.priceCents, 21000);
+  assert.equal(migrated.spec, '1.8kg'); assert.equal(migrated.unit, '件'); assert.equal(migrated.split, undefined);
+  assert.equal(portion.purchaseIdentity.kind, 'portion'); assert.equal(portion.priceCents, 6000);
+  assert.equal(portion.unit, '份'); assert.notEqual(portion.version, original.version);
+  const confirmed = await c.addWhole();
+  assert.equal(confirmed.id, migrated.id); assert.equal(confirmed.quoteExpired, false);
+  const unique = c.customer.list(f.batch, c.token).products;
+  assert.equal(unique.length, 1); assert.equal(unique[0].previousProductId, original.id);
+  await c.customer.submit(f.batch, c.token, c.payload([{ product: portion, quantity: 3 }, { product: confirmed }]));
+  const lines = f.store.listOrderLines(f.batch.code);
+  assert.equal(lines.length, 2);
+  assert.equal(lines.find(line => line.productId === original.id).snapshot.unit, '份');
+  assert.equal(lines.find(line => line.productId === migrated.id).snapshot.unit, '件');
+});
+
+test('a legacy private quote already contaminated with portion data requires a verified whole quote instead of treating the portion price as whole', async t => {
+  const f = fixture(t); const c = customerFixture(f);
+  const personal = { id: 'self_2_6505_111', name: '旧污染的分装资料', spec: rule.portionSpec, unit: '份', priceCents: 6000,
+    source, spuId: '111', onSale: false, selectable: false, version: 'a'.repeat(64), expiresAt: '2026-10-14T00:00:00Z',
+    split: { ...rule }, recommendedProductId: 'beef', selfSelected: true,
+    reusedProductId: 'beef', localVersion: productVersion(f.store.getProduct('beef')) };
+  f.store.saveCustomerProduct(f.batch.code, customerOwner(c.token), samsStoreKey(storeLocation), personal, f.now());
+  const listed = c.customer.list(f.batch, c.token).products[0];
+  assert.equal(listed.priceCents, null); assert.equal(listed.selectable, false);
+  assert.equal(listed.split, undefined); assert.equal(listed.recommendedProductId, undefined);
+  assert.equal(listed.purchaseIdentity.kind, 'whole'); assert.match(listed.selectionUnavailableReason, /整包报价.*查询/);
+  const confirmed = await c.addWhole();
+  assert.equal(confirmed.priceCents, 21000); assert.equal(confirmed.spec, '1.8kg'); assert.equal(confirmed.unit, '件');
+  await c.customer.submit(f.batch, c.token, c.payload([{ product: confirmed }]));
+  assert.equal(f.store.listOrderLines(f.batch.code)[0].snapshot.priceCents, 21000);
+  assert.equal(f.store.listOrderLines(f.batch.code)[0].snapshot.split, undefined);
+});
+
+test('mixed whole and portion orders roll back both lines and drafts when a later line fails', async t => {
+  const f = fixture(t); const c = customerFixture(f); const whole = await c.addWhole();
+  const portion = f.service.getCatalog(f.batch).products.find(product => product.id === 'beef');
+  const payload = c.payload([{ product: portion, quantity: 3 }, { product: whole }]);
+  f.store.db.exec(`CREATE TRIGGER fail_whole BEFORE INSERT ON order_lines WHEN NEW.product_id='self_2_6505_111' BEGIN SELECT RAISE(ABORT,'mixed rollback'); END`);
+  await assert.rejects(c.customer.submit(f.batch, c.token, payload), /mixed rollback/);
   assert.equal(f.store.listOrderLines(f.batch.code).length, 0);
-  // Even an old invalid persisted configuration cannot use a selected alias.
-  f.store.importProducts([...products, { ...products[0], id: 'alias' }]);
-  f.store.updateBatch(f.batch.code, { productIds: ['beef', 'alias'] });
-  const alias = f.service.getCatalog(f.batch).products.find(p => p.id === 'alias');
-  assert.throws(() => f.service.quote(f.batch, { items: [{ productId: alias.id, quantity: 1, version: alias.version }], phone }), { code: 'SPLIT_RECOMMENDATION_REQUIRED' });
+  assert.equal(f.store.getSubmission(f.batch.code, payload.submissionId), null);
+  assert.equal(f.store.getProduct(whole.id), null);
+});
+
+test('a portion specification change during whole detail refresh rejects a mixed order before committing old units', async t => {
+  const f = fixture(t); const c = customerFixture(f); const whole = await c.addWhole();
+  const portion = f.service.getCatalog(f.batch).products.find(product => product.id === 'beef');
+  const payload = c.payload([{ product: portion, quantity: 3 }, { product: whole }]);
+  c.state.hook = () => f.service.updateBatch(f.batch.code, { splitRules: { beef: { ...rule, portionSpec: '新分装规格', priceCents: 7000 } } });
+  await assert.rejects(c.customer.submit(f.batch, c.token, payload), { code: 'PRODUCT_CHANGED' });
+  assert.equal(f.store.listOrderLines(f.batch.code).length, 0); assert.equal(f.store.getSubmission(f.batch.code, payload.submissionId), null);
+  c.state.hook = null;
+  const currentWhole = c.customer.list(f.batch, c.token).products[0];
+  const currentPortion = f.service.getCatalog(f.batch).products.find(product => product.id === 'beef');
+  await c.customer.submit(f.batch, c.token, c.payload([{ product: currentPortion, quantity: 3 }, { product: currentWhole }]));
+  const lines = f.store.listOrderLines(f.batch.code);
+  assert.equal(lines.find(line => line.productId === 'beef').snapshot.spec, '新分装规格');
+  assert.equal(lines.find(line => line.productId === whole.id).snapshot.spec, '1.8kg');
 });
