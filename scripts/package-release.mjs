@@ -9,7 +9,9 @@ import { fileURLToPath } from 'node:url';
 const execute = promisify(execFile);
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const directories = ['dist', 'server', 'scripts', 'ops'];
-const rootFiles = ['package.json', 'package-lock.json', 'README.md'];
+const rootFiles = ['package.json', 'package-lock.json', 'README.md', 'LICENSE', 'COMMERCIAL_LICENSE.md', 'NOTICE.md'];
+const documentationFiles = ['doc/README.md', 'doc/usage.md', 'doc/pricing-and-portions.md',
+  'doc/feishu.md', 'doc/maintenance.md', 'doc/deployment.md', 'doc/sams-browser.md', 'doc/licensing.md'];
 const forbiddenDirectories = new Set(['node_modules', 'test', 'tests', 'test-results', '__tests__']);
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 
@@ -45,7 +47,16 @@ export async function packageRelease({ root = projectRoot, commit = process.env.
     if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`缺少发布目录或目录类型无效：${directory}`);
     await collectFiles(root, directory, files);
   }
-  for (const file of rootFiles) await collectFiles(root, file, files);
+  const documentationDirectory = await lstat(join(root, 'doc'));
+  if (!documentationDirectory.isDirectory() || documentationDirectory.isSymbolicLink()) throw new Error('缺少发布目录或目录类型无效：doc');
+  // Publish only these documentation files; local acceptance and private notes
+  // may share doc/ without entering the release.
+  for (const file of [...rootFiles, ...documentationFiles]) {
+    const info = await lstat(join(root, file));
+    if (info.isSymbolicLink()) throw new Error(`发布文件不能是符号链接：${file}`);
+    if (!info.isFile()) throw new Error(`发布文件类型无效：${file}`);
+    files.push(file);
+  }
   files.sort();
   if (!files.includes('dist/index.html') || !files.includes('server/index.js') || !files.includes('ops/deploy-release.sh')) {
     throw new Error('请先构建前端，并确保服务入口和 ops/deploy-release.sh 已存在。');
