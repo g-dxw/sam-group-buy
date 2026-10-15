@@ -9,9 +9,9 @@ import { fileURLToPath } from 'node:url';
 const execute = promisify(execFile);
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const directories = ['dist', 'server', 'scripts', 'ops'];
-const rootFiles = ['package.json', 'package-lock.json', 'README.md'];
+const rootFiles = ['package.json', 'package-lock.json', 'README.md', 'LICENSE', 'COMMERCIAL_LICENSE.md', 'NOTICE.md'];
 const documentationFiles = ['doc/README.md', 'doc/usage.md', 'doc/pricing-and-portions.md',
-  'doc/feishu.md', 'doc/maintenance.md', 'doc/deployment.md', 'doc/sams-browser.md'];
+  'doc/feishu.md', 'doc/maintenance.md', 'doc/deployment.md', 'doc/sams-browser.md', 'doc/licensing.md'];
 const forbiddenDirectories = new Set(['node_modules', 'test', 'tests', 'test-results', '__tests__']);
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 

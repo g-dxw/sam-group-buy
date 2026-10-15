@@ -47,3 +47,9 @@ npm start
 | `doc/` | 项目文档 |
 
 业务数据库、配置和后台密码默认保存在 `.data/`，请定期[备份](doc/maintenance.md#备份与恢复)。
+
+## 许可证
+
+本项目自有代码采用 **GPL-3.0-only + 单独书面商业授权**，两种路径任选其一。GPL 本身允许商用；希望闭源分发或取得 GPL 之外的许可条件时，可申请商业授权。
+
+详见[双授权指南](doc/licensing.md)、[GPL 全文](LICENSE)、[商业授权说明](COMMERCIAL_LICENSE.md)和[版权与第三方声明](NOTICE.md)。

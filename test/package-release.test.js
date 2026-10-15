@@ -11,7 +11,8 @@ import { packageRelease } from '../scripts/package-release.mjs';
 const execute = promisify(execFile);
 const commit = '1234567890abcdef1234567890abcdef12345678';
 const documentationFiles = ['doc/README.md', 'doc/usage.md', 'doc/pricing-and-portions.md',
-  'doc/feishu.md', 'doc/maintenance.md', 'doc/deployment.md', 'doc/sams-browser.md'];
+  'doc/feishu.md', 'doc/maintenance.md', 'doc/deployment.md', 'doc/sams-browser.md', 'doc/licensing.md'];
+const licensingFiles = ['LICENSE', 'COMMERCIAL_LICENSE.md', 'NOTICE.md'];
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'sam-package-test-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -19,6 +20,7 @@ async function fixture(t) {
     'server/index.js': 'console.log("server")', 'scripts/backup-local.mjs': 'export {}',
     'ops/deploy-release.sh': '#!/bin/sh\nexit 0\n', 'package.json': '{"name":"sam-group-buy"}',
     'package-lock.json': '{}', 'README.md': 'Deployment instructions',
+    ...Object.fromEntries(licensingFiles.map(path => [path, `License and notice fixture: ${path}`])),
     ...Object.fromEntries(documentationFiles.map(path => [path, `Public documentation: ${path}`])) };
   for (const [path, content] of Object.entries(files)) {
     await mkdir(dirname(join(root, path)), { recursive: true });
@@ -83,4 +85,12 @@ test('文档目录不能通过符号链接引用外部目录，白名单文档�
   await mkdir(outside);
   await symlink(outside, join(root, 'doc'));
   await assert.rejects(packageRelease({ root, commit }), /目录类型无效：doc/);
+});
+
+test('发布包必须包含许可证原文，LICENSE缺失或为符号链接时拒绝', async t => {
+  const { root } = await fixture(t);
+  await rm(join(root, 'LICENSE'));
+  await assert.rejects(packageRelease({ root, commit }), { code: 'ENOENT', path: join(root, 'LICENSE') });
+  await symlink(join(root, 'README.md'), join(root, 'LICENSE'));
+  await assert.rejects(packageRelease({ root, commit }), /符号链接.*LICENSE/);
 });

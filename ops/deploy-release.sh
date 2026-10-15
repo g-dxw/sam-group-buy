@@ -34,7 +34,7 @@ const [action, rootInput, ...args] = process.argv.slice(2);
 const SHA = /^[0-9a-f]{40}$/;
 const HEX = /^[0-9a-f]{64}$/;
 const documentationFiles = new Set(['doc/README.md', 'doc/usage.md', 'doc/pricing-and-portions.md',
-  'doc/feishu.md', 'doc/maintenance.md', 'doc/deployment.md', 'doc/sams-browser.md']);
+  'doc/feishu.md', 'doc/maintenance.md', 'doc/deployment.md', 'doc/sams-browser.md', 'doc/licensing.md']);
 const root = resolve(rootInput || '');
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const abort = () => { throw new Error('deployment validation failed'); };
@@ -69,7 +69,7 @@ function allowed(path) {
   if (name === '验收记录.md' || /\.(?:sqlite(?:3)?|db)(?:-(?:wal|shm))?$|\.(?:key|pem|p12|pfx)$/i.test(name)
     || (parts[0] === 'scripts' && /^(?:smoke|test)(?:[._-]|$)/i.test(name))) return false;
   if (parts[0] === 'doc') return documentationFiles.has(path);
-  return parts.length === 1 ? ['package.json', 'package-lock.json', 'README.md'].includes(path)
+  return parts.length === 1 ? ['package.json', 'package-lock.json', 'README.md', 'LICENSE', 'COMMERCIAL_LICENSE.md', 'NOTICE.md'].includes(path)
     : ['dist', 'server', 'scripts', 'ops'].includes(parts[0]);
 }
 function validateManifest(value, sha) {

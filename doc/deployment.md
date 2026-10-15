@@ -31,3 +31,5 @@ CI 在 main 推送和 Pull Request 上运行 Node 24 的测试、前端构建和
 ## 发布包中的文档
 
 发布包包含根目录 `README.md`，以及 `doc/` 中明确列入白名单的公开文档，保留文档导航。`doc/验收记录.md` 和未列入白名单的其他文档不进入发布包。新增公开文档时，需要同时更新 `scripts/package-release.mjs` 与 `ops/deploy-release.sh` 的文件白名单。
+
+发布包同时保留根目录 `LICENSE`、`COMMERCIAL_LICENSE.md`、`NOTICE.md` 与 `doc/licensing.md`。双授权的选择方式见[授权指南](licensing.md)。

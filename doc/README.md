@@ -10,6 +10,7 @@
 | [本地运行与维护](maintenance.md) | 启动、初始密码、旧版迁移、环境配置、备份与恢复 |
 | [部署指南](deployment.md) | GitHub Actions、发布包、systemd、Nginx 与回滚 |
 | [山姆商品查询工具](sams-browser.md) | 独立 Python 查询工具的运行、接口来源与限制 |
+| [GPL 与商业双授权](licensing.md) | GPL-3.0-only、商业许可申请、版权与第三方内容范围 |
 
 所有命令均在项目根目录执行；环境变量模板见项目根目录的 `.env.example`。
 

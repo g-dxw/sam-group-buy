@@ -1,6 +1,7 @@
 {
   "name": "sam-group-buy",
   "version": "0.1.0",
+  "license": "SEE LICENSE IN doc/licensing.md",
   "private": true,
   "type": "module",
   "engines": {

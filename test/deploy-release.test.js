@@ -14,7 +14,8 @@ const script = resolve('ops/deploy-release.sh');
 const sha = number => number.toString(16).padStart(40, '0');
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const documentationFiles = ['doc/README.md', 'doc/usage.md', 'doc/pricing-and-portions.md',
-  'doc/feishu.md', 'doc/maintenance.md', 'doc/deployment.md', 'doc/sams-browser.md'];
+  'doc/feishu.md', 'doc/maintenance.md', 'doc/deployment.md', 'doc/sams-browser.md', 'doc/licensing.md'];
+const licensingFiles = ['LICENSE', 'COMMERCIAL_LICENSE.md', 'NOTICE.md'];
 const backupScript = `import { mkdirSync, copyFileSync, appendFileSync, readlinkSync } from 'node:fs';
 import { join, basename } from 'node:path';
 const destination = process.argv[2];
@@ -28,6 +29,7 @@ const files = () => ({
   'package.json': '{"name":"release-fixture","version":"1.0.0","private":true}',
   'package-lock.json': '{"name":"release-fixture","lockfileVersion":3,"packages":{}}',
   'README.md': 'Deployment fixture',
+  ...Object.fromEntries(licensingFiles.map(path => [path, `License and notice fixture: ${path}`])),
   ...Object.fromEntries(documentationFiles.map(path => [path, `Public documentation: ${path}`])),
 });
 function tar(entries) {
@@ -130,7 +132,7 @@ test('首发与相同SHA重跑：私有env仅链接、依赖禁用scripts、无�
   assert.equal(await context.current(), commit);
   assert.equal(await readlink(join(context.deployment, 'releases', commit, '.env')), join(context.deployment, 'shared', '.env'));
   assert.equal(await readFile(join(context.deployment, 'shared', '.env'), 'utf8'), context.environment);
-  for (const path of documentationFiles) {
+  for (const path of [...documentationFiles, ...licensingFiles]) {
     assert.equal(await readFile(join(context.deployment, 'releases', commit, path), 'utf8'), files()[path]);
   }
   const first = await context.actions();
@@ -145,13 +147,14 @@ test('首发与相同SHA重跑：私有env仅链接、依赖禁用scripts、无�
   assert.equal(result.stdout.includes('DO-NOT-LOG-PRIVATE'), false);
 });
 
-test('旧发布包缺少doc目录时仍可部署', async t => {
+test('旧发布包缺少doc目录和授权文件时仍可部署', async t => {
   const context = await fixture(t), commit = sha(1);
-  const source = Object.fromEntries(Object.entries(files()).filter(([path]) => !path.startsWith('doc/')));
+  const source = Object.fromEntries(Object.entries(files()).filter(([path]) => !path.startsWith('doc/') && !licensingFiles.includes(path)));
   context.allowed.add(commit);
   assert.match((await context.run(await artifact(context, commit, { source }))).stdout, /Deployment succeeded/);
   assert.equal(await context.current(), commit);
-  assert.equal((await readdir(join(context.deployment, 'releases', commit))).includes('doc'), false);
+  const extracted = await readdir(join(context.deployment, 'releases', commit));
+  for (const path of ['doc', ...licensingFiles]) assert.equal(extracted.includes(path), false);
 });
 
 test('升级前在线备份原数据，原子previous/current切换，最多保留三份release', async t => {
@@ -202,6 +205,7 @@ test('sha、manifest hash、越界、隐藏数据、symlink/hardlink和额外tar
     { tarEntries: normalEntries.map(entry => entry.path === 'server/index.js' ? { ...entry, type: '2', link: '../outside' } : entry) },
     { tarEntries: normalEntries.map(entry => entry.path === 'server/index.js' ? { ...entry, type: '1', link: 'dist/index.html' } : entry) },
     { tarEntries: normalEntries.map(entry => entry.path === 'doc/usage.md' ? { ...entry, type: '2', link: '../README.md' } : entry) },
+    { tarEntries: normalEntries.map(entry => entry.path === 'LICENSE' ? { ...entry, type: '2', link: 'README.md' } : entry) },
     { tarEntries: [...normalEntries, normalEntries[0]] },
   ];
   for (const [index, options] of attempts.entries()) await assert.rejects(context.run(await artifact(context, sha(index + 10), options)));
