@@ -4,6 +4,27 @@
 
 商品与订单以本地数据库为准，飞书用于可选的手动备份和订单导出。网页不在线收款，付款需独立确认。
 
+## 界面预览
+
+以下截图使用演示商品与虚拟订单，图片已压缩为 WebP，点击可查看大图。
+
+**顾客选品**：浏览本期精选，查看商品售价并加入购物车。
+
+[![顾客选品页，展示本期精选商品、售价和加购入口](doc/images/customer-products.webp)](doc/images/customer-products.webp)
+
+<details>
+<summary>查看管理后台：团购期次与订单统计</summary>
+
+**团购期次**：按小区管理每期商品、取货安排及收集链接。
+
+[![管理后台团购期次页，展示期次列表、分享二维码和本期安排](doc/images/admin-batches.webp)](doc/images/admin-batches.webp)
+
+**订单统计**：查看采购汇总、代购费和顾客订单。
+
+[![管理后台订单统计页，展示费用汇总和按商品统计的采购清单](doc/images/admin-orders.webp)](doc/images/admin-orders.webp)
+
+</details>
+
 ## 快速启动
 
 需要 Node.js 24 或更高版本及 npm。山姆查询与本地商品管理无需配置飞书。
